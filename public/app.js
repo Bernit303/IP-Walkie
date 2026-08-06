@@ -1,0 +1,206 @@
+let ws;
+let myId;
+let myName;
+let localStream;
+let audioTrack;
+let floorHolder = null; // id of whoever currently holds the channel
+const peers = new Map(); // id -> RTCPeerConnection
+const audioEls = new Map();
+
+const pttBtn = document.getElementById('ptt');
+const statusEl = document.getElementById('status');
+const peerListEl = document.getElementById('peer-list');
+const nameInput = document.getElementById('name-input');
+const joinBtn = document.getElementById('join-btn');
+const setupEl = document.getElementById('setup');
+const talkEl = document.getElementById('talk');
+
+const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+joinBtn.addEventListener('click', join);
+nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') join(); });
+
+async function join() {
+  myName = nameInput.value.trim() || 'Anon';
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    alert('Microphone access denied. Allow the mic in your browser settings and reload.');
+    return;
+  }
+  audioTrack = localStream.getAudioTracks()[0];
+  audioTrack.enabled = false; // muted until PTT is held
+  setupEl.classList.add('hidden');
+  talkEl.classList.remove('hidden');
+  connect();
+}
+
+function connect() {
+  ws = new WebSocket(`wss://${location.host}`);
+  pttBtn.disabled = true;
+
+  ws.addEventListener('open', () => {
+    statusEl.textContent = 'Connected';
+    pttBtn.disabled = false;
+  });
+  ws.addEventListener('close', () => {
+    statusEl.textContent = 'Disconnected — reload to rejoin';
+    pttBtn.disabled = true;
+  });
+
+  ws.addEventListener('message', async (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === 'welcome') {
+      myId = msg.id;
+      ws.send(JSON.stringify({ type: 'join', name: myName }));
+      return;
+    }
+
+    if (msg.type === 'peers') {
+      const incomingIds = new Set(msg.peers.map((p) => p.id));
+      for (const p of msg.peers) {
+        if (!peers.has(p.id)) createPeer(p.id, myId < p.id);
+      }
+      for (const id of [...peers.keys()]) {
+        if (!incomingIds.has(id)) removePeer(id);
+      }
+      renderPeerList(msg.peers);
+      return;
+    }
+
+    if (msg.type === 'offer') {
+      const pc = peers.get(msg.from) || createPeer(msg.from, false);
+      await pc.setRemoteDescription(msg.sdp);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      ws.send(JSON.stringify({ type: 'answer', target: msg.from, sdp: pc.localDescription }));
+      return;
+    }
+
+    if (msg.type === 'answer') {
+      const pc = peers.get(msg.from);
+      if (pc) await pc.setRemoteDescription(msg.sdp);
+      return;
+    }
+
+    if (msg.type === 'ice') {
+      const pc = peers.get(msg.from);
+      if (pc && msg.candidate) {
+        try { await pc.addIceCandidate(msg.candidate); } catch {}
+      }
+      return;
+    }
+
+    if (msg.type === 'floor') {
+      floorHolder = msg.holder;
+      if (floorHolder === myId) {
+        audioTrack.enabled = true;
+        pttBtn.classList.add('active');
+        pttBtn.textContent = 'TALKING';
+      } else if (floorHolder) {
+        audioTrack.enabled = false;
+        pttBtn.classList.remove('active');
+        pttBtn.textContent = msg.priority ? `⭐ ${msg.name} IS TALKING` : `${msg.name} IS TALKING`;
+      } else {
+        audioTrack.enabled = false;
+        pttBtn.classList.remove('active');
+        pttBtn.textContent = 'HOLD TO TALK';
+      }
+      return;
+    }
+
+    if (msg.type === 'floor-denied') {
+      pttBtn.textContent = `${msg.name} IS TALKING`;
+      return;
+    }
+
+    if (msg.type === 'floor-preempted') {
+      statusEl.textContent = `Interrupted by ⭐ ${msg.by}`;
+      setTimeout(() => { statusEl.textContent = 'Connected'; }, 3000);
+      return;
+    }
+  });
+}
+
+function createPeer(id, initiator) {
+  const pc = new RTCPeerConnection(config);
+  peers.set(id, pc);
+
+  localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+
+  pc.addEventListener('track', (event) => {
+    let audioEl = audioEls.get(id);
+    if (!audioEl) {
+      audioEl = new Audio();
+      audioEl.autoplay = true;
+      audioEls.set(id, audioEl);
+    }
+    audioEl.srcObject = event.streams[0];
+  });
+
+  pc.addEventListener('icecandidate', (event) => {
+    if (event.candidate) {
+      ws.send(JSON.stringify({ type: 'ice', target: id, candidate: event.candidate }));
+    }
+  });
+
+  if (initiator) {
+    pc.addEventListener('negotiationneeded', async () => {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({ type: 'offer', target: id, sdp: pc.localDescription }));
+    });
+  }
+
+  return pc;
+}
+
+function removePeer(id) {
+  const pc = peers.get(id);
+  if (pc) pc.close();
+  peers.delete(id);
+  const audioEl = audioEls.get(id);
+  if (audioEl) audioEl.srcObject = null;
+  audioEls.delete(id);
+}
+
+function renderPeerList(list) {
+  peerListEl.innerHTML = '';
+  if (list.length === 0) {
+    peerListEl.innerHTML = '<li class="empty">No one else here yet</li>';
+    return;
+  }
+  for (const p of list) {
+    const li = document.createElement('li');
+    li.textContent = p.priority ? `⭐ ${p.name}` : p.name;
+    peerListEl.appendChild(li);
+  }
+}
+
+function startTalk() {
+  if (!audioTrack || floorHolder || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'ptt-start' }));
+}
+
+function stopTalk() {
+  if (!audioTrack || floorHolder !== myId || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'ptt-stop' }));
+}
+
+pttBtn.addEventListener('pointerdown', startTalk);
+pttBtn.addEventListener('pointerup', stopTalk);
+pttBtn.addEventListener('pointercancel', stopTalk);
+pttBtn.addEventListener('pointerleave', stopTalk);
+pttBtn.addEventListener('lostpointercapture', stopTalk);
+
+// Defensive releases: if the tab is backgrounded, the device sleeps, or the
+// window loses focus mid-transmission, don't leave the channel locked.
+window.addEventListener('blur', stopTalk);
+window.addEventListener('pagehide', stopTalk);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopTalk();
+});
+
+window.addEventListener('keydown', (e) => { if (e.code === 'Space' && !e.repeat) startTalk(); });
+window.addEventListener('keyup', (e) => { if (e.code === 'Space') stopTalk(); });

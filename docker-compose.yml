@@ -1,0 +1,21 @@
+services:
+  lan-walkie:
+    build: .
+    image: lan-walkie:latest
+    container_name: lan-walkie
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    volumes:
+      - lan-walkie-certs:/app/certs
+    environment:
+      - PORT=8443
+      # Uncomment and set these for Docker deployments — the container can't
+      # see the host's real LAN IP/hostname to put in its cert automatically.
+      # - CERT_HOSTNAMES=walkie.home,optibox
+      # - CERT_IPS=192.168.1.3
+      # - MAX_TRANSMIT_MS=60000
+      # - PRIORITY_TOKEN=some-long-random-string
+
+volumes:
+  lan-walkie-certs:

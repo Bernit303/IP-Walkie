@@ -1,0 +1,111 @@
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #10151a;
+  color: #e8edf2;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  user-select: none;
+}
+
+.screen {
+  width: 100%;
+  max-width: 420px;
+  padding: 32px 24px;
+  text-align: center;
+}
+
+.hidden { display: none; }
+
+h1 { margin: 0 0 8px; font-size: 28px; }
+h2 { font-size: 15px; color: #8b98a5; margin: 32px 0 8px; text-transform: uppercase; letter-spacing: 0.08em; }
+p { color: #8b98a5; margin: 0 0 24px; }
+
+input {
+  width: 100%;
+  padding: 14px 16px;
+  font-size: 17px;
+  border-radius: 10px;
+  border: 1px solid #2a333c;
+  background: #1a2129;
+  color: #e8edf2;
+  margin-bottom: 16px;
+}
+
+button#join-btn {
+  width: 100%;
+  padding: 14px;
+  font-size: 17px;
+  font-weight: 600;
+  border-radius: 10px;
+  border: none;
+  background: #3b82f6;
+  color: white;
+  cursor: pointer;
+}
+
+#status {
+  color: #8b98a5;
+  font-size: 14px;
+  margin-bottom: 24px;
+}
+
+button#ptt {
+  width: 220px;
+  height: 220px;
+  border-radius: 50%;
+  border: 4px solid #3b82f6;
+  background: #1a2129;
+  color: #3b82f6;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  touch-action: none;
+  transition: transform 0.08s ease, background 0.08s ease;
+}
+
+button#ptt.active {
+  background: #ef4444;
+  border-color: #ef4444;
+  color: white;
+  transform: scale(0.96);
+}
+
+button#ptt:disabled {
+  background: #1a2129;
+  border-color: #4b5563;
+  color: #8b98a5;
+  cursor: not-allowed;
+  font-size: 15px;
+}
+
+.hint {
+  margin-top: 20px;
+  font-size: 13px;
+}
+
+ul#peer-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  text-align: left;
+}
+
+ul#peer-list li {
+  padding: 10px 14px;
+  background: #1a2129;
+  border-radius: 8px;
+  margin-bottom: 6px;
+  font-size: 15px;
+}
+
+ul#peer-list li.empty {
+  color: #8b98a5;
+  background: none;
+  padding-left: 0;
+}
