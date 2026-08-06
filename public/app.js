@@ -17,22 +17,51 @@ const talkEl = document.getElementById('talk');
 
 const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-joinBtn.addEventListener('click', join);
-nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') join(); });
+// The floor is exclusive — you never hear your own remote peers while
+// transmitting, so there's no full-duplex/echo scenario here. Browser echo
+// cancellation/noise suppression/AGC add real processing latency for a
+// benefit this app structurally doesn't need; turn them off.
+const audioConstraints = {
+  echoCancellation: false,
+  noiseSuppression: false,
+  autoGainControl: false,
+};
 
-async function join() {
-  myName = nameInput.value.trim() || 'Anon';
+const NAME_KEY = 'walkie-name';
+const myNameLabel = document.getElementById('my-name-label');
+const changeNameLink = document.getElementById('change-name');
+
+joinBtn.addEventListener('click', () => join(nameInput.value.trim()));
+nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') join(nameInput.value.trim()); });
+changeNameLink.addEventListener('click', (e) => {
+  e.preventDefault();
+  localStorage.removeItem(NAME_KEY);
+  location.reload();
+});
+
+async function join(name) {
+  myName = name || 'Anon';
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
   } catch (e) {
     alert('Microphone access denied. Allow the mic in your browser settings and reload.');
     return;
   }
+  localStorage.setItem(NAME_KEY, myName);
   audioTrack = localStream.getAudioTracks()[0];
   audioTrack.enabled = false; // muted until PTT is held
   setupEl.classList.add('hidden');
   talkEl.classList.remove('hidden');
+  myNameLabel.textContent = myName;
   connect();
+}
+
+// Remembered from a previous visit — this is a family device, names don't
+// change often, so skip straight past the name prompt instead of asking
+// every time.
+const savedName = localStorage.getItem(NAME_KEY);
+if (savedName) {
+  join(savedName);
 }
 
 function connect() {
@@ -137,6 +166,11 @@ function createPeer(id, initiator) {
       audioEls.set(id, audioEl);
     }
     audioEl.srcObject = event.streams[0];
+
+    // Chrome-only, silently ignored elsewhere: shrinks the jitter buffer's
+    // target delay. Worth trading a little resilience to network jitter for
+    // lower mouth-to-ear latency on a LAN.
+    try { event.receiver.playoutDelayHint = 0; } catch {}
   });
 
   pc.addEventListener('icecandidate', (event) => {
@@ -193,6 +227,13 @@ pttBtn.addEventListener('pointerup', stopTalk);
 pttBtn.addEventListener('pointercancel', stopTalk);
 pttBtn.addEventListener('pointerleave', stopTalk);
 pttBtn.addEventListener('lostpointercapture', stopTalk);
+
+// Mobile browsers treat a held-down touch as a long-press gesture and pop up
+// their own share/save/copy menu, which steals the touch — that fires
+// pointercancel mid-transmission and looks like PTT randomly cutting out
+// after about a second. CSS (touch-action, -webkit-touch-callout) heads most
+// of this off; this is the last-resort backstop for whatever slips through.
+pttBtn.addEventListener('contextmenu', (e) => e.preventDefault());
 
 // Defensive releases: if the tab is backgrounded, the device sleeps, or the
 // window loses focus mid-transmission, don't leave the channel locked.

@@ -30,13 +30,13 @@ versions, works the same on 22.04 and 24.04.
 ## Run it
 
 ```bash
-python3 lan_walkie_cli.py wss://192.168.1.3:8443 --name "Farmnode"
+python3 lan_walkie_cli.py wss://<server-ip>:8443 --name "HeadlessNode"
 ```
 
-(swap in optibox's real IP.) You'll see:
+(swap in your server's real IP.) You'll see:
 
 ```
-Connecting to wss://192.168.1.3:8443 as 'Farmnode'...
+Connecting to wss://<server-ip>:8443 as 'HeadlessNode'...
 [ready — space to talk, q to quit]
 ```
 
@@ -57,7 +57,7 @@ aplay -l     # playback devices
 Then point the client at the right one:
 
 ```bash
-python3 lan_walkie_cli.py wss://192.168.1.3:8443 --name "Farmnode" \
+python3 lan_walkie_cli.py wss://<server-ip>:8443 --name "HeadlessNode" \
     --source "alsasrc device=hw:1,0" \
     --sink "alsasink device=hw:2,0"
 ```
@@ -68,7 +68,7 @@ Useful for checking the network/signaling side works before you've plugged
 anything in:
 
 ```bash
-python3 lan_walkie_cli.py wss://192.168.1.3:8443 --name "Test" \
+python3 lan_walkie_cli.py wss://<server-ip>:8443 --name "Test" \
     --source "audiotestsrc is-live=true wave=silence" \
     --sink fakesink
 ```
@@ -90,7 +90,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/lan-walkie-cli/lan_walkie_cli.py wss://192.168.1.3:8443 --name "Farmnode"
+ExecStart=/usr/bin/python3 /opt/lan-walkie-cli/lan_walkie_cli.py wss://<server-ip>:8443 --name "HeadlessNode"
 Restart=on-failure
 User=your-username
 
@@ -116,7 +116,7 @@ Pi Pico, a footswitch controller, whatever's upstream — drives transmit
 directly over USB serial, no keyboard involved:
 
 ```bash
-python3 lan_walkie_cli.py wss://192.168.1.3:8443 --name "Farmnode" \
+python3 lan_walkie_cli.py wss://<server-ip>:8443 --name "HeadlessNode" \
     --serial /dev/ttyACM0 \
     --source "alsasrc device=hw:1,0" \
     --sink "alsasink device=hw:2,0"
@@ -217,8 +217,8 @@ Since `--serial` mode doesn't need a keyboard, it's a good fit for the
 systemd service above — just add the flags:
 
 ```
-ExecStart=/usr/bin/python3 /opt/lan-walkie-cli/lan_walkie_cli.py wss://192.168.1.3:8443 \
-    --name "Farmnode" --serial /dev/ttyACM0 \
+ExecStart=/usr/bin/python3 /opt/lan-walkie-cli/lan_walkie_cli.py wss://<server-ip>:8443 \
+    --name "HeadlessNode" --serial /dev/ttyACM0 \
     --source "alsasrc device=hw:1,0" --sink "alsasink device=hw:2,0"
 ```
 
@@ -240,7 +240,7 @@ PRIORITY_TOKEN=some-long-random-string node server.js
 give this client the same token:
 
 ```bash
-python3 lan_walkie_cli.py wss://192.168.1.3:8443 --name "Farmnode" \
+python3 lan_walkie_cli.py wss://<server-ip>:8443 --name "HeadlessNode" \
     --token some-long-random-string --serial /dev/ttyACM0 ...
 ```
 
@@ -252,7 +252,7 @@ version control (pass it via environment variable or a systemd
 
 With a valid token, this node bumps whoever's currently talking instead
 of getting denied — the bumped person's client gets an explicit
-"interrupted by ⭐ Farmnode" notice and drops back to listening
+"interrupted by ⭐ HeadlessNode" notice and drops back to listening
 immediately. Every participant — browser or CLI — sees a ⭐ next to this
 node's name in the peer list, so it's visually obvious which one is the
 priority node without having to guess from context.

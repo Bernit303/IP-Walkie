@@ -169,5 +169,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`LAN Walkie running on https://<optibox-ip>:${PORT}`);
+  const lanIp = detectLocalAddresses().find((ip) => ip !== '127.0.0.1') || 'localhost';
+  console.log(`LAN Walkie running on https://${lanIp}:${PORT}`);
 });

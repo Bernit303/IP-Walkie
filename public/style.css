@@ -66,6 +66,12 @@ button#ptt {
   letter-spacing: 0.05em;
   cursor: pointer;
   touch-action: none;
+  /* Stops iOS/Android's long-press share/save/copy menu from grabbing the
+     touch mid-hold — without this a PTT press looks like it works for about
+     a second, then gets cancelled when the system menu pops up. */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
   transition: transform 0.08s ease, background 0.08s ease;
 }
 
@@ -87,6 +93,18 @@ button#ptt:disabled {
 .hint {
   margin-top: 20px;
   font-size: 13px;
+}
+
+.you-line {
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.you-line strong { color: #e8edf2; }
+
+#change-name {
+  color: #3b82f6;
+  text-decoration: none;
 }
 
 ul#peer-list {

@@ -19,10 +19,10 @@ npm start
 You'll see:
 
 ```
-LAN Walkie running on https://<optibox-ip>:8443
+LAN Walkie running on https://<your-server-ip>:8443
 ```
 
-From any phone or laptop on the same network, go to `https://192.168.1.3:8443` (swap in optibox's actual IP). Click "Advanced" then "Proceed" through the cert warning. After that it just works.
+From any phone or laptop on the same network, go to `https://<your-server-ip>:8443` (swap in your server's actual LAN IP). Click "Advanced" then "Proceed" through the cert warning. After that it just works.
 
 ## Run it as a Portainer stack
 
@@ -48,15 +48,15 @@ services:
       - lan-walkie-certs:/app/certs
     environment:
       - PORT=8443
-      - CERT_HOSTNAMES=walkie.home,optibox
-      - CERT_IPS=192.168.1.3
+      - CERT_HOSTNAMES=your-hostname
+      - CERT_IPS=192.168.1.100
       - MAX_TRANSMIT_MS=60000
 
 volumes:
   lan-walkie-certs:
 ```
 
-**Why `CERT_HOSTNAMES`/`CERT_IPS` matter here:** the server generates its cert by auto-detecting its own hostname and network interfaces. Run directly with `node server.js`, that correctly sees optibox's real LAN identity. Run inside Docker, it instead sees the *container's* internal identity — something like `172.18.0.2` — because that's genuinely what the container's network namespace looks like from the inside. The cert would be valid for an address nobody ever visits. Setting `CERT_IPS` to optibox's actual LAN IP (and `CERT_HOSTNAMES` to whatever name you use to reach it) fixes that. Delete the `lan-walkie-certs` volume and restart if you change these after the first run — the cert is generated once and cached.
+**Why `CERT_HOSTNAMES`/`CERT_IPS` matter here:** the server generates its cert by auto-detecting its own hostname and network interfaces. Run directly with `node server.js`, that correctly sees your host's real LAN identity. Run inside Docker, it instead sees the *container's* internal identity — something like `172.18.0.2` — because that's genuinely what the container's network namespace looks like from the inside. The cert would be valid for an address nobody ever visits. Setting `CERT_IPS` to your server's actual LAN IP (and `CERT_HOSTNAMES` to whatever name you use to reach it) fixes that. Delete the `lan-walkie-certs` volume and restart if you change these after the first run — the cert is generated once and cached.
 
 `MAX_TRANSMIT_MS` (default 60000) is a safety net: if something holds the floor and never sends a release — a frozen tab, a dead battery, a crashed headless client — the server force-releases it after this many milliseconds so the channel can't get stuck.
 
@@ -73,36 +73,10 @@ docker run -d --name lan-walkie -p 8443:8443 -v lan-walkie-certs:/app/certs lan-
 
 then reference `image: lan-walkie:latest` in a stack without a `build:` line.
 
-## Hosting it from a private git repo (for Portainer)
-
-Portainer's git-based stacks need somewhere to pull the Dockerfile from. To
-keep it private:
-
-1. Create a new **private** repository (GitHub, GitLab, your own Gitea —
-   whatever you already use).
-2. Push this project to it:
-   ```bash
-   cd lan-walkie
-   git init
-   git add .
-   git commit -m "LAN Walkie"
-   git remote add origin git@github.com:yourname/lan-walkie.git
-   git push -u origin main
-   ```
-3. In Portainer: **Stacks → Add stack → Repository**.
-   - Repository URL: your repo's URL.
-   - Since it's private, Portainer needs credentials — either a **Personal
-     Access Token** (GitHub: Settings → Developer settings → Fine-grained
-     tokens, scoped to just this repo, read-only) or an SSH deploy key,
-     depending on which auth method Portainer's version offers you. Paste
-     that into the "Authentication" fields on the same screen.
-   - Compose path: `docker-compose.yml` (default, since it's at the repo
-     root here).
-4. Deploy. Portainer clones the repo, builds the image from the
-   `Dockerfile`, and starts it.
-
-Every time you `git push` an update, Portainer's stack has a "pull and
-redeploy" option to update it — no need to re-paste anything.
+If deploying from a git repository in Portainer, use the **Repository**
+build method (not a plain compose paste) — Portainer needs the actual
+source to build the image from the `Dockerfile`. Every `git push` after
+that, the stack has a "pull and redeploy" option to update it.
 
 ## Headless client (no browser / no GUI)
 
