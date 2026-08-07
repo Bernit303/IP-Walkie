@@ -6,6 +6,8 @@ let audioTrack;
 let floorHolder = null; // id of whoever currently holds the channel
 const peers = new Map(); // id -> RTCPeerConnection
 const audioEls = new Map();
+let reconnectTimer = null;
+let backoff = 1000;
 
 const pttBtn = document.getElementById('ptt');
 const statusEl = document.getElementById('status');
@@ -71,11 +73,9 @@ function connect() {
   ws.addEventListener('open', () => {
     statusEl.textContent = 'Connected';
     pttBtn.disabled = false;
+    backoff = 1000;
   });
-  ws.addEventListener('close', () => {
-    statusEl.textContent = 'Disconnected — reload to rejoin';
-    pttBtn.disabled = true;
-  });
+  ws.addEventListener('close', scheduleReconnect);
 
   ws.addEventListener('message', async (event) => {
     const msg = JSON.parse(event.data);
@@ -152,6 +152,36 @@ function connect() {
   });
 }
 
+// Wi-Fi roaming between rooms/access points looks exactly like a dropped
+// connection to the browser — the previous behavior ("Disconnected — reload
+// to rejoin") required a human to notice and act, which doesn't work for
+// parents who won't know to do that. Reconnect automatically instead, same
+// backoff shape as the CLI's connection_loop() (1s → 2s → 4s... capped at
+// 30s, reset to 1s on success).
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  statusEl.textContent = 'Reconnecting…';
+  pttBtn.disabled = true;
+  resetForReconnect();
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, backoff);
+  backoff = Math.min(backoff * 2, 30000);
+}
+
+// The server hands out a fresh id and peer list on rejoin — anything tied
+// to the old connection (peer ids, in-flight WebRTC connections, floor
+// state) is meaningless once it's gone and must not linger into the next
+// session.
+function resetForReconnect() {
+  for (const id of [...peers.keys()]) removePeer(id);
+  floorHolder = null;
+  if (audioTrack) audioTrack.enabled = false;
+  pttBtn.classList.remove('active');
+  pttBtn.textContent = 'HOLD TO TALK';
+}
+
 function createPeer(id, initiator) {
   const pc = new RTCPeerConnection(config);
   peers.set(id, pc);
@@ -176,6 +206,24 @@ function createPeer(id, initiator) {
   pc.addEventListener('icecandidate', (event) => {
     if (event.candidate) {
       ws.send(JSON.stringify({ type: 'ice', target: id, candidate: event.candidate }));
+    }
+  });
+
+  // A broken Wi-Fi path (a roam between access points, mid-call) shows up
+  // here as 'failed' — with no recovery, that peer just stays silently dead
+  // until someone reloads. Rebuild it instead. Deliberately not reacting to
+  // 'disconnected': browsers routinely recover from that on their own (it's
+  // often just a brief packet-loss blip) and escalate to 'failed' themselves
+  // if it doesn't resolve — acting earlier would tear down connections that
+  // were about to heal on their own.
+  pc.addEventListener('iceconnectionstatechange', () => {
+    if (pc.iceConnectionState === 'failed') {
+      removePeer(id);
+      if (myId < id) {
+        createPeer(id, true); // negotiationneeded fires a fresh offer automatically
+      }
+      // Non-initiator side just waits for that new offer, same as first
+      // contact — see the 'offer' handler in connect().
     }
   });
 
