@@ -87,12 +87,19 @@ sudo tee /etc/systemd/system/lan-walkie-cli.service << 'EOF'
 Description=LAN Walkie CLI client
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /opt/lan-walkie-cli/lan_walkie_cli.py wss://<server-ip>:8443 --name "HeadlessNode"
-Restart=on-failure
+Restart=always
+RestartSec=5
 User=your-username
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=80
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+OOMScoreAdjust=-1000
 
 [Install]
 WantedBy=multi-user.target
@@ -101,6 +108,58 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --now lan-walkie-cli
 ```
+
+**Why `Restart=always`, not `Restart=on-failure`:** the client itself
+reconnects automatically when it loses the signaling server (see below) —
+`systemd` restarting the process is only the fallback for the client
+crashing outright, not for ordinary disconnects. But a clean process exit
+looks like *success* to `on-failure`, so a rare unhandled crash that exits
+with status 0 would never be restarted under that policy. `always` covers
+that gap. `StartLimitIntervalSec=0` disables systemd's crash-loop
+rate-limiting entirely, so a box stuck in an unrelated crash loop still
+keeps trying forever rather than giving up after N restarts — appropriate
+for something meant to run unattended for weeks between checks, less
+appropriate if you'd rather be alerted than have it retry silently.
+
+**Reconnects on its own — outages don't need a service restart.** If the
+signaling server goes down (reboot, power loss) or the network blips, the
+client stays running and retries the connection with backoff (1s, 2s,
+4s... capped at 30s) instead of exiting. A Pico on `--serial` stays
+connected through this the whole time — only the signaling/WebRTC side
+resets, not the serial link. Once the server's back, it rejoins
+automatically with the same `--name`/`--token` — no one needs to be there
+to press anything. This is the main reason a box running this can survive
+"the router lost power overnight" unattended.
+
+**Real-time scheduling priority** (not to be confused with the walkie
+floor-preemption `--token` feature further below — this is OS-level CPU/IO
+priority, a different thing entirely). Worth setting explicitly if this box
+also runs other work — a small server doing double duty as an IoT hub,
+say — and this service should never lose out to whatever else is running:
+
+- `CPUSchedulingPolicy=rr` + `CPUSchedulingPriority=80` puts this process on
+  a real-time scheduling class, ahead of normal (non-real-time) processes
+  for CPU time. `rr` (round-robin) rather than `fifo`, and 80 rather than
+  the ceiling of 99: `rr` still time-slices between real-time processes at
+  the same priority, so a runaway or spinning thread in this process can't
+  fully lock out the rest of the box the way an unbounded `fifo` at max
+  priority could. 80 is comfortably ahead of anything else without
+  reaching for the literal maximum — bump it if it's ever not aggressive
+  enough in practice.
+- `IOSchedulingClass=realtime` + `IOSchedulingPriority=0` does the same for
+  disk I/O.
+- `OOMScoreAdjust=-1000` tells the kernel's out-of-memory killer to
+  effectively never target this process, even under memory pressure from
+  something else on the box.
+- These apply to the whole process at launch, and threads it spawns
+  (GStreamer's internal threads, the serial reader thread) inherit them —
+  no code changes needed for this to take effect.
+- **Network priority is deliberately not included here.** Real traffic
+  shaping (`tc`, cgroup `net_prio`) is meaningfully more complex and easy
+  to misconfigure — and misconfiguring it on a box whose entire job is
+  networking is a worse failure mode than not having it. Worth revisiting
+  if this box ever runs something that actually contends for bandwidth;
+  skip it until then.
 
 Note: PTT via Space bar obviously doesn't work in a service with no
 attached terminal. Without `--serial`, a service instance is listen-only —

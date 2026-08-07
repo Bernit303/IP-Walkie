@@ -12,8 +12,8 @@ services:
       - PORT=8443
       # Uncomment and set these for Docker deployments — the container can't
       # see the host's real LAN IP/hostname to put in its cert automatically.
-      # - CERT_HOSTNAMES=walkie.home,optibox
-      # - CERT_IPS=192.168.1.3
+      # - CERT_HOSTNAMES=your-hostname
+      # - CERT_IPS=192.168.1.100
       # - MAX_TRANSMIT_MS=60000
       # - PRIORITY_TOKEN=some-long-random-string
 

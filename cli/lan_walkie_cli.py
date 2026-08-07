@@ -19,7 +19,7 @@ Install (Ubuntu/Debian):
   pip install websockets --break-system-packages
 
 Run:
-  python3 lan_walkie_cli.py wss://192.168.1.3:8443 --name "Farmnode"
+  python3 lan_walkie_cli.py wss://<server-ip>:8443 --name "HeadlessNode"
 
 Controls once connected:
   SPACE   start/stop talking
@@ -252,6 +252,22 @@ class WalkieClient:
         if peer.mixer_pad:
             self.mixer.release_request_pad(peer.mixer_pad)
 
+    def reset_for_reconnect(self):
+        """
+        Tear down everything tied to the old signaling connection so the next
+        one starts clean. Peer ids and floor state come from the server and
+        are meaningless once we've lost it — a stale webrtcbin left over from
+        before the drop would just confuse renegotiation with whatever's
+        handed out after we reconnect.
+        """
+        for pid in list(self.peers.keys()):
+            self.remove_peer(pid)
+        self.my_id = None
+        self.floor_holder = None
+        self.talking = False
+        self.mic_mute.set_property("mute", True)
+        self.send_serial("RX:0")  # nothing can be arriving with no connection
+
     # ---------- signaling ----------
 
     def _send_threadsafe(self, msg):
@@ -414,37 +430,72 @@ class WalkieClient:
 
         import websockets
 
-        print(f"Connecting to {self.url} as '{self.name}'...")
-        async with websockets.connect(self.url, ssl=ssl_ctx) as ws:
-            self.ws = ws
+        quit_event = asyncio.Event()
 
-            tasks = {asyncio.create_task(self._recv_loop())}
+        # Input sources don't belong to any one connection attempt — start
+        # them once, outside the reconnect loop below, so a Pico mid-session
+        # never sees its serial link bounce and a keyboard operator never
+        # loses keystrokes typed during a reconnect.
+        if self.serial_port:
+            self.start_serial_thread()
+            print(f"[ready — driven by {self.serial_port}, Ctrl+C to quit]")
+        elif sys.stdin.isatty():
+            print("[ready — space to talk, q to quit]")
+            key_queue = asyncio.Queue()
+            self.start_keyboard_thread(key_queue)
 
-            if self.serial_port:
-                self.start_serial_thread()
-                print(f"[ready — driven by {self.serial_port}, Ctrl+C to quit]")
-            elif sys.stdin.isatty():
-                print("[ready — space to talk, q to quit]")
-                key_queue = asyncio.Queue()
-                self.start_keyboard_thread(key_queue)
+            async def keys():
+                while True:
+                    ch = await key_queue.get()
+                    if ch == " ":
+                        await self.toggle_talk()
+                    elif ch == "q":
+                        print("\nDisconnected.")
+                        quit_event.set()
+                        return
 
-                async def keys():
-                    while True:
-                        ch = await key_queue.get()
-                        if ch == " ":
-                            await self.toggle_talk()
-                        elif ch == "q":
-                            raise SystemExit
+            asyncio.create_task(keys())
+        else:
+            print("[ready — no TTY and no --serial given, this instance is listen-only]")
 
-                tasks.add(asyncio.create_task(keys()))
-            else:
-                print("[ready — no TTY and no --serial given, this instance is listen-only]")
+        # Outages are a "when, not if" on a 24/7 unattended box — the
+        # signaling server rebooting, a power blip, or a flaky network link
+        # all just look like the connection dropping. Reconnect with backoff
+        # instead of exiting; a clean process exit here previously looked
+        # like success to systemd's `Restart=on-failure` and the service
+        # would just stay dead until someone noticed and restarted it by
+        # hand.
+        async def connection_loop():
+            backoff = 1
+            while True:
+                try:
+                    print(f"Connecting to {self.url} as '{self.name}'...")
+                    async with websockets.connect(self.url, ssl=ssl_ctx) as ws:
+                        self.ws = ws
+                        backoff = 1
+                        print("[connected]")
+                        await self._recv_loop()
+                except Exception as e:
+                    print(f"[connection error] {e}", file=sys.stderr)
 
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-            for task in pending:
-                task.cancel()
+                self.ws = None
+                self.reset_for_reconnect()
+                print(f"[disconnected — retrying in {backoff}s]", file=sys.stderr)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
 
-        self.pipeline.set_state(Gst.State.NULL)
+        try:
+            conn_task = asyncio.create_task(connection_loop())
+            quit_task = asyncio.create_task(quit_event.wait())
+            done, pending = await asyncio.wait({conn_task, quit_task}, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            # connection_loop() only ever finishes by raising (it's an
+            # infinite retry loop) — surface that instead of swallowing it.
+            if conn_task in done:
+                conn_task.result()
+        finally:
+            self.pipeline.set_state(Gst.State.NULL)
 
     async def _recv_loop(self):
         async for raw in self.ws:
