@@ -205,7 +205,7 @@ so `--serial` mode gets true hold-to-talk timing — it starts exactly when
 the trigger goes active and stops exactly when it goes inactive, same as
 the browser's PTT button.
 
-Minimal MicroPython on the Pico side, USB CDC serial, both directions:
+Minimal CircuitPython on the Pico side, USB CDC serial, both directions:
 
 ```python
 import usb_cdc
@@ -244,6 +244,11 @@ Swap `trigger.value` for whatever the actual upstream IoT signal ends up
 being — a GPIO from another board, a UART line, an I2C read. The Pico's
 job is just "translate whatever that signal is doing into `TX:1`/`TX:0`
 lines," the CLI doesn't need to know anything about the original trigger.
+
+**Testing this without the real trigger yet:** see [`../pico/`](../pico/)
+for a ready-to-flash MicroPython variant that adds a BOOTSEL-button PTT
+override and onboard-LED status feedback, purely for bringing up the
+serial link and hardware before the real trigger is decided.
 
 ### Audio routing: line-in / line-out instead of a mic/speaker
 
