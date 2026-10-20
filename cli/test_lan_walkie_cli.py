@@ -200,21 +200,26 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("a=rtpmap:111 opus/48000/2", out)
         self.assertNotIn("ice-ufrag", out)
 
-    def test_stats_counters_are_extracted(self):
+    def test_debug_status_never_polls_webrtc_stats(self):
+        # Regression: polling webrtcbin "get-stats" every few seconds per peer
+        # coincided with the gateway growing to 3.4 GB and being OOM-killed.
+        # The status line must read memory from /proc instead.
         import io
         from contextlib import redirect_stderr
 
-        c = cli.WalkieClient("wss://x", "R", "s", "k", None, "system")
-        promise = MagicMock()
-        promise.get_reply.return_value.to_string.return_value = (
-            'x, a=(structure)"outbound-rtp, packets-sent=(guint64)812, bytes-sent=(guint64)9;", '
-            'b=(structure)"inbound-rtp, packets-received=(guint64)40;";'
-        )
+        c = cli.WalkieClient("wss://x", "R", "s", "k", None, "system", vox_debug=True)
+        c.pipeline = MagicMock()
+        peer = cli.Peer("p1", "Dad")
+        peer.webrtcbin = MagicMock()
+        c.peers["p1"] = peer
         buf = io.StringIO()
         with redirect_stderr(buf):
-            c._on_stats(promise, "Dad")
-        self.assertIn("sent ['812']", buf.getvalue())
-        self.assertIn("received ['40']", buf.getvalue())
+            c._debug_status()
+        peer.webrtcbin.emit.assert_not_called()
+        self.assertIn("memory", buf.getvalue())
+
+    def test_rss_reading_is_an_integer(self):
+        self.assertIsInstance(cli.WalkieClient._rss_mb(), int)
 
     def test_mixer_has_latency_slack(self):
         cli.Gst.parse_launch.reset_mock()

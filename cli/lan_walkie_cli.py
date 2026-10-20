@@ -234,6 +234,7 @@ class WalkieClient:
         self._level_msgs = 0
         self._dbg_status_last = 0
         self._dbg_peak = float("-inf")
+        self._dbg_window_peak = float("-inf")
         self._dbg_last = time.monotonic()
 
         self.ws = None
@@ -287,7 +288,7 @@ class WalkieClient:
             bus.connect("message::element", self.on_bus_element)
             GLib.timeout_add_seconds(5, self._check_levels_flowing)
             if self.vox_debug:
-                GLib.timeout_add_seconds(2, self._debug_status)
+                GLib.timeout_add_seconds(5, self._debug_status)
 
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -315,29 +316,27 @@ class WalkieClient:
         lines = [ln.strip() for ln in sdp_text.splitlines() if ln.startswith(keep)]
         print(f"[sdp] {label}: " + " | ".join(lines), file=sys.stderr)
 
-    def _on_stats(self, promise, name):
-        """--vox-debug: RTP packet counters from webrtcbin, to see if audio really moves."""
+    @staticmethod
+    def _rss_mb():
+        """Resident memory of this process in MB (Linux), or -1 if unknown."""
         try:
-            promise.wait()
-            text = promise.get_reply().to_string()
-            sent = re.findall(r"packets-sent=\(guint64\)(\d+)", text)
-            recv = re.findall(r"packets-received=\(guint64\)(\d+)", text)
-            print(f"[rtp] {name}: packets sent {sent or '-'} received {recv or '-'}", file=sys.stderr)
-        except Exception as e:
-            print(f"[rtp] {name}: stats unavailable ({e})", file=sys.stderr)
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) // 1024
+        except (OSError, ValueError):
+            pass
+        return -1
 
     def _debug_status(self):
-        for peer in list(self.peers.values()):
-            if peer.webrtcbin is not None:
-                promise = Gst.Promise.new_with_change_func(self._on_stats, safe_text(peer.name, 20))
-                peer.webrtcbin.emit("get-stats", None, promise)
         n = self._level_msgs
         delta, self._dbg_status_last = n - self._dbg_status_last, n
+        quiet_peak, self._dbg_window_peak = self._dbg_window_peak, float("-inf")
         state = self.pipeline.get_state(0)[1].value_nick
         print(
-            f"[vox] status: {delta} level readings in the last 2 s, pipeline {state}, "
-            f"{len(self.peers)} peer(s), floor holder {self.floor_holder!r}, "
-            f"radio keyed {bool(self.ptt and self.ptt.keyed)}",
+            f"[vox] status: {delta} level readings in 5 s, input peak {quiet_peak:.1f} dBFS, "
+            f"pipeline {state}, {len(self.peers)} peer(s), floor holder {self.floor_holder!r}, "
+            f"radio keyed {bool(self.ptt and self.ptt.keyed)}, memory {self._rss_mb()} MB",
             file=sys.stderr,
         )
         return True  # repeat
@@ -367,12 +366,16 @@ class WalkieClient:
         self._level_msgs += 1
         if self.vox_debug:
             self._dbg_peak = max(self._dbg_peak, level_db)
+            self._dbg_window_peak = max(self._dbg_window_peak, level_db)
             now = time.monotonic()
             if now - self._dbg_last >= 1.0:
-                print(
-                    f"[vox] input peak {self._dbg_peak:6.1f} dBFS (threshold {self.vox.threshold_db:.0f})",
-                    file=sys.stderr,
-                )
+                # Idle noise is summarised in the 5 s status line; only audio
+                # near or above the threshold gets its own line.
+                if self._dbg_peak > self.vox.threshold_db - 10:
+                    print(
+                        f"[vox] input peak {self._dbg_peak:6.1f} dBFS (threshold {self.vox.threshold_db:.0f})",
+                        file=sys.stderr,
+                    )
                 self._dbg_peak = float("-inf")
                 self._dbg_last = now
         blocked = (self.ptt is not None and self.ptt.keyed) or time.monotonic() < self._vox_blocked_until
