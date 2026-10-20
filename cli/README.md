@@ -187,7 +187,7 @@ root) if the gateway needs priority.
 | `--name` | Display name (sanitised by the server, 24 chars) |
 | `--source`, `--sink`, `--alsa-device` | Audio endpoints |
 | `--stun ""` | Disable STUN (STUN sees this machine's public IP; unnecessary on LAN/Tailscale) |
-| `--upnp` | Re-enable libnice's automatic router port mappings. **Off by default**: on Ubuntu 24.04 (libnice 0.1.21 / libgupnp-igd 1.6) UPnP made the process grow by about 230 MB/min while a peer was connected. See `docs/MEMORY_LEAK_AUDIT.md` |
+| `--upnp` | Re-enable libnice's automatic router port mappings, and accept libnice's default behaviour if it can't be switched off. **Off by default** (the gateway refuses to connect if it can't confirm UPnP is off): on Ubuntu 24.04 (libnice 0.1.21 / libgupnp-igd 1.6) UPnP made the process grow by about 230 MB/min while a peer was connected. See `docs/MEMORY_LEAK_AUDIT.md` |
 | `--ca-file`, `--pin-sha256`, `--insecure` | TLS trust, see above |
 | `--aioc`, `--ptt-serial`, `--ptt-tail-ms`, `--max-ptt-seconds` | Radio keying |
 | `--no-vox`, `--vox-threshold-db`, `--vox-attack-ms`, `--vox-hang-ms` | Radio receive detection |

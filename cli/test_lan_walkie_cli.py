@@ -124,6 +124,7 @@ class PeerWiringTests(unittest.TestCase):
         queue = MagicMock()
         ice = wb.get_property.return_value
         agent = ice.get_property.return_value
+        agent.get_property.return_value = False  # readback: UPnP is off
 
         def added(el):
             if el is wb:
@@ -137,21 +138,72 @@ class PeerWiringTests(unittest.TestCase):
         finally:
             cli.Gst.ElementFactory.make.side_effect = None
 
-    def test_upnp_setup_failure_warns_but_does_not_crash(self):
-        import io
-        from contextlib import redirect_stderr
-
+    def test_upnp_setup_failure_refuses_to_connect(self):
+        # A failed "turn UPnP off" must not look like success: continuing would
+        # bring back the ~230 MB/min growth silently.
         wb = MagicMock()
         wb.get_property.side_effect = TypeError("no such property")
-        buf = io.StringIO()
-        with redirect_stderr(buf):
-            cli.configure_upnp(wb, False)  # must not raise
-        self.assertIn("could not set libnice UPnP", buf.getvalue())
+        with self.assertRaises(cli.UpnpConfigError):
+            cli.configure_upnp(wb, False)
+
+    def test_upnp_still_on_after_setting_it_off_refuses(self):
+        wb = MagicMock()
+        agent = wb.get_property.return_value.get_property.return_value
+        agent.get_property.return_value = True  # readback says it is still on
+        with self.assertRaises(cli.UpnpConfigError):
+            cli.configure_upnp(wb, False)
+
+    def test_upnp_off_is_confirmed_by_readback(self):
+        wb = MagicMock()
+        agent = wb.get_property.return_value.get_property.return_value
+        agent.get_property.return_value = False
+        cli.configure_upnp(wb, False)  # must not raise
+        agent.set_property.assert_called_once_with("upnp", False)
+
+    def test_opting_in_with_upnp_flag_never_raises(self):
+        wb = MagicMock()
+        wb.get_property.side_effect = TypeError("no such property")
+        cli.configure_upnp(wb, True)  # operator accepted the default behaviour
+
+    def test_refused_upnp_adds_nothing_to_the_pipeline(self):
+        c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
+        c.pipeline, c.tee = MagicMock(), MagicMock()
+        wb = MagicMock()
+        wb.get_property.side_effect = TypeError("no such property")
+        cli.Gst.ElementFactory.make.side_effect = [wb]
+        try:
+            with self.assertRaises(cli.UpnpConfigError):
+                c.create_peer_connection(cli.Peer("p", "P"), False)
+        finally:
+            cli.Gst.ElementFactory.make.side_effect = None
+        c.pipeline.add.assert_not_called()
 
     def test_upnp_can_be_explicitly_enabled(self):
         wb = MagicMock()
         cli.configure_upnp(wb, True)
         wb._walkie_ice.get_property.return_value.set_property.assert_called_once_with("upnp", True)
+
+    def test_reconnect_unkeys_the_radio_before_any_native_teardown(self):
+        # Review finding: peers were torn down (native, potentially blocking)
+        # before the radio was unkeyed, so a hung teardown left it transmitting.
+        import asyncio
+
+        async def scenario():
+            ptt = cli.AiocPtt("fake-port")
+            c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system", ptt=ptt)
+            c.loop = asyncio.get_running_loop()
+            c.mic_mute = MagicMock()
+            c.radio_key()
+            self.assertTrue(ptt.keyed)
+            c.peers["p"] = cli.Peer("p", "P")
+            seen = []
+            c.remove_peer = lambda pid: seen.append(ptt.keyed)
+            c.reset_for_reconnect()
+            return seen, ptt.keyed
+
+        seen, keyed_after = asyncio.run(scenario())
+        self.assertEqual(seen, [False])
+        self.assertFalse(keyed_after)
 
     def test_each_peer_gets_a_leaky_queue_between_tee_and_webrtcbin(self):
         c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
@@ -162,6 +214,8 @@ class PeerWiringTests(unittest.TestCase):
         def make(factory, name=None):
             el = MagicMock(name=factory)
             el.factory = factory
+            # webrtcbin.get_property("ice-agent").get_property("agent").get_property("upnp")
+            el.get_property.return_value.get_property.return_value.get_property.return_value = False
             made.append(el)
             return el
 
@@ -190,6 +244,7 @@ class PeerWiringTests(unittest.TestCase):
         def make(factory, name=None):
             el = MagicMock(name=factory)
             el.factory = factory
+            el.get_property.return_value.get_property.return_value.get_property.return_value = False
             if factory == "webrtcbin":
                 el.connect.side_effect = lambda signal, *a: order.append(("connect", signal))
             return el

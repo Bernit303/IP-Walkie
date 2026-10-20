@@ -75,23 +75,40 @@ def normalize_pin(pin):
     return re.sub(r"[^0-9a-f]", "", pin.lower())
 
 
+class UpnpConfigError(RuntimeError):
+    """libnice's UPnP could not be switched off (or confirmed off)."""
+
+
 def configure_upnp(webrtcbin, enabled=False):
     """Configure libnice before candidate gathering starts.
 
     UPnP is unnecessary on LAN/Tailscale and the Ubuntu 24.04 IGD stack can
-    grow without bound while retrying router port mappings. Keep the ICE
-    wrapper for the element's lifetime: temporary wrappers crashed on 1.24.2.
+    grow without bound while retrying router port mappings (about 230 MB/min).
+    The setting is read back; if UPnP was asked to be OFF and cannot be
+    confirmed off, this raises instead of continuing, because continuing would
+    silently bring the memory growth back. Passing --upnp (enabled=True) means
+    the operator accepted libnice's default behaviour, so nothing is enforced.
+
+    The ICE wrapper is kept on the element: a temporary wrapper crashed on
+    1.24.2 during setup.
     """
     try:
         webrtcbin._walkie_ice = webrtcbin.get_property("ice-agent")
         agent = webrtcbin._walkie_ice.get_property("agent")
         agent.set_property("upnp", enabled)
+        actual = agent.get_property("upnp")
     except Exception as e:
-        # A different GStreamer/libnice may not expose these properties. Keep
-        # running (the connection still works) but say so: on a router with UPnP
-        # the process may then grow without bound.
-        print(f"[warning] could not set libnice UPnP={enabled} ({e}); memory may grow "
-              "on networks whose router offers UPnP", file=sys.stderr)
+        if enabled:
+            return
+        raise UpnpConfigError(
+            f"could not turn libnice UPnP off ({e}). Refusing to connect: with UPnP on, "
+            "the process can grow without bound. Pass --upnp to accept that risk."
+        ) from e
+    if not enabled and bool(actual):
+        raise UpnpConfigError(
+            "libnice UPnP is still on after trying to turn it off. Refusing to connect. "
+            "Pass --upnp to accept that risk."
+        )
 
 
 class Vox:
@@ -696,19 +713,23 @@ class WalkieClient:
         one starts clean. Peer ids and floor state come from the server and
         are meaningless once we've lost it — a stale webrtcbin left over from
         before the drop would just confuse renegotiation with whatever's
-        handed out after we reconnect. The radio is unkeyed immediately: with
-        no signaling nobody can be authorized to transmit through it.
+        handed out after we reconnect.
+
+        The radio is unkeyed FIRST, before anything that touches native
+        GStreamer objects: with no signaling nobody can be authorized to
+        transmit through it, and a teardown that blocked on this thread would
+        also block the watchdog that shares the event loop.
         """
+        self.radio_unkey(immediate=True)
+        self.mic_mute.set_property("mute", True)
+        self.talking = False
+        self.have_floor = False
+        if self.vox:
+            self.vox.reset()
         for pid in list(self.peers.keys()):
             self.remove_peer(pid)
         self.my_id = None
         self.floor_holder = None
-        self.talking = False
-        self.have_floor = False
-        self.mic_mute.set_property("mute", True)
-        if self.vox:
-            self.vox.reset()
-        self.radio_unkey(immediate=True)
 
     # ---------- signaling ----------
 
