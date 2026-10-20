@@ -466,9 +466,11 @@ class WalkieClient:
         if self.stun:
             webrtcbin.set_property("stun-server", self.stun)
 
-        self.pipeline.add(webrtcbin)
-        webrtcbin.sync_state_with_parent()
-
+        # Attach EVERY listener before the element joins the pipeline. webrtcbin
+        # raises "negotiation needed" once; if that happens while it is being
+        # started and nobody is listening yet, the gateway never sends its offer
+        # and the peer connection never starts (floor messages still work over
+        # the server, so it looks half-alive but carries no audio).
         webrtcbin.connect("on-ice-candidate", self.on_ice_candidate, peer_id)
         webrtcbin.connect("pad-added", self.on_pad_added, peer)
         webrtcbin.connect(
@@ -479,6 +481,9 @@ class WalkieClient:
         )
         if initiator:
             webrtcbin.connect("on-negotiation-needed", self.on_negotiation_needed, peer_id)
+
+        self.pipeline.add(webrtcbin)
+        webrtcbin.sync_state_with_parent()
 
         # Fan the shared outgoing audio into this peer's connection, through
         # a small leaky queue. Without it, a peer whose webrtcbin isn't
@@ -503,6 +508,8 @@ class WalkieClient:
         return webrtcbin
 
     def on_negotiation_needed(self, webrtcbin, peer_id):
+        if self.vox_debug:
+            print(f"[gw] negotiation needed for {peer_id}: sending an offer", file=sys.stderr)
         promise = Gst.Promise.new_with_change_func(self.on_offer_created, webrtcbin, peer_id)
         webrtcbin.emit("create-offer", None, promise)
 

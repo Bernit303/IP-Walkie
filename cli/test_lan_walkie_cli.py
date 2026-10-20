@@ -142,6 +142,31 @@ class PeerWiringTests(unittest.TestCase):
         # tee pad feeds the queue, not webrtcbin directly
         c.tee.get_request_pad.return_value.link.assert_called_once_with(queues[0].get_static_pad.return_value)
 
+    def test_negotiation_listener_is_attached_before_the_element_joins_the_pipeline(self):
+        # Regression: connecting it after pipeline.add()/sync_state_with_parent()
+        # missed webrtcbin's one-shot "negotiation needed", so a gateway that had
+        # to start the connection (its id sorts lower) never sent an offer.
+        c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
+        c.pipeline = MagicMock()
+        c.tee = MagicMock()
+        order = []
+
+        def make(factory, name=None):
+            el = MagicMock(name=factory)
+            el.factory = factory
+            if factory == "webrtcbin":
+                el.connect.side_effect = lambda signal, *a: order.append(("connect", signal))
+            return el
+
+        c.pipeline.add.side_effect = lambda el: order.append(("add", el.factory))
+        cli.Gst.ElementFactory.make.side_effect = make
+        try:
+            c.create_peer_connection(cli.Peer("p1", "Dad"), initiator=True)
+        finally:
+            cli.Gst.ElementFactory.make.side_effect = None
+        self.assertLess(order.index(("connect", "on-negotiation-needed")), order.index(("add", "webrtcbin")))
+        self.assertLess(order.index(("connect", "on-ice-candidate")), order.index(("add", "webrtcbin")))
+
     def test_remove_peer_releases_the_queue(self):
         c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
         c.pipeline, c.tee, c.mixer = MagicMock(), MagicMock(), MagicMock()
