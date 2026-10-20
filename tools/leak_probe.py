@@ -86,23 +86,43 @@ def run_variant(name, tail, seconds=30):
             c.handle_remote_ice("remote", item)
     rw.connect("on-ice-candidate", on_remote_ice)
 
+    problems = []
+    ice_state = {"v": "new"}
+
     def on_offer_created(promise, _u):
         promise.wait()
-        offer = promise.get_reply().get_value("offer")
+        reply = promise.get_reply()
+        offer = reply.get_value("offer") if reply is not None else None
+        if offer is None:
+            problems.append("the fake remote peer could not create an offer: %s"
+                            % (reply.to_string()[:200] if reply is not None else "no reply"))
+            return
         rw.emit("set-local-description", offer, Gst.Promise.new())
         c.handle_offer("remote", offer.sdp.as_text())
         for item in pending:
             c.handle_remote_ice("remote", item)
         pending.clear()
 
-    rw.connect("on-negotiation-needed",
-               lambda wb: wb.emit("create-offer", None, Gst.Promise.new_with_change_func(on_offer_created, None)))
+    rw.connect("notify::ice-connection-state",
+               lambda wb, _p: ice_state.__setitem__("v", wb.get_property("ice-connection-state").value_nick))
     remote.set_state(Gst.State.PLAYING)
-    time.sleep(8)
-    a = rss_mb()
-    time.sleep(seconds)
-    b = rss_mb()
-    print("%-30s %6.1f -> %6.1f MB  (%+.1f MB/min)" % (name, a, b, (b - a) * 60.0 / seconds), flush=True)
+    # Offer only after audio is flowing, so the sender already knows its media
+    # type; creating it earlier yields an empty offer.
+    time.sleep(1.5)
+    rw.emit("create-offer", None, Gst.Promise.new_with_change_func(on_offer_created, None))
+    time.sleep(7)
+
+    got_audio = bool(keep) if tail != "app" else peer.mixer_pad is not None
+    connected = ice_state["v"] in ("connected", "completed")
+    if problems or not (connected and got_audio):
+        print("%-30s INVALID: connection=%s, receiving audio=%s %s"
+              % (name, ice_state["v"], got_audio, "; ".join(problems)), flush=True)
+    else:
+        a = rss_mb()
+        time.sleep(seconds)
+        b = rss_mb()
+        print("%-30s %6.1f -> %6.1f MB  (%+.1f MB/min)  [connected, audio flowing]"
+              % (name, a, b, (b - a) * 60.0 / seconds), flush=True)
     remote.set_state(Gst.State.NULL)
     c.pipeline.set_state(Gst.State.NULL)
     c.glib_loop.quit()
