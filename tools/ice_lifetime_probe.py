@@ -29,12 +29,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CYCLES = 20
 VARIANTS = (
     ("none", "no UPnP change at all (control: must be clean)"),
-    ("attr", "wrapper stored on the element (current code)"),
-    ("after", "wrapper kept, released only after the element is gone"),
-    ("registry", "wrapper kept forever in a module-level list"),
-    ("extra-ref", "wrapper kept on the element plus one extra reference"),
+    ("attr", "wrapper stored on the element (the code as pushed; known bad)"),
+    ("ref-temp", "give the wrapper its own reference, keep nothing"),
+    ("ref-attr", "give the wrapper its own reference AND store it on the element"),
+    ("ref-after", "own reference, wrapper released only after the element is gone"),
 )
 KEEP = []
+
+
+def add_ref(obj):
+    """g_object_ref() on the C object behind a PyGObject wrapper (hash() is its address)."""
+    import ctypes
+
+    lib = ctypes.CDLL("libgobject-2.0.so.0")
+    lib.g_object_ref.argtypes = [ctypes.c_void_p]
+    lib.g_object_ref.restype = ctypes.c_void_p
+    lib.g_object_ref(ctypes.c_void_p(hash(obj)))
 
 
 def rss_mb():
@@ -68,26 +78,22 @@ def child(variant):
             agent.set_property("upnp", False)
             if i == 0:
                 readback = agent.get_property("upnp")
-            if variant == "attr":
+            if variant.startswith("ref"):
+                before = getattr(ice, "__grefcount__", "?")
+                add_ref(ice)
+                if i == 0:
+                    notes.append("refcount %s -> %s" % (before, getattr(ice, "__grefcount__", "?")))
+            if variant in ("attr", "ref-attr"):
                 wb._ice = ice
-            elif variant == "after":
+            elif variant == "ref-after":
                 pending.append(ice)
-            elif variant == "registry":
-                KEEP.append(ice)
-            elif variant == "extra-ref":
-                ref = getattr(ice, "ref", None)
-                if ref is None:
-                    notes.append("no ref() method on this wrapper")
-                else:
-                    ref()
-                wb._ice = ice
             del agent
             del ice
         wb.set_state(Gst.State.READY)
         wb.set_state(Gst.State.NULL)
         del wb
         gc.collect()
-        if variant == "after":
+        if variant == "ref-after":
             pending.clear()
             gc.collect()
     gc.collect()
