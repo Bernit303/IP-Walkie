@@ -236,6 +236,26 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ptt.keyed)
         self.assertTrue(c.have_floor)
 
+    async def test_taking_the_floor_does_not_lock_out_vox(self):
+        # Regression: the gateway granted itself the floor for radio->LAN audio,
+        # the "make sure the radio is unkeyed" step blocked VOX for 0.5 s, VOX
+        # reported "stop", and the floor was released again immediately.
+        c, ptt = self.make_client()
+        c.vox.active = True
+        await c.handle_message(floor("aaaa", "Radio"))
+        self.assertEqual(c._vox_blocked_until, 0.0)
+        self.assertEqual(c.vox.update(-10, 20, blocked=False), None)  # still active, not stopped
+        self.assertTrue(c.vox.active)
+
+    async def test_real_unkey_still_blocks_vox_briefly(self):
+        c, ptt = self.make_client()
+        await c.handle_message(floor("bbbb", "Dad"))
+        self.assertTrue(ptt.keyed)
+        await c.handle_message(floor(None))
+        await asyncio.sleep(0.15)
+        self.assertFalse(ptt.keyed)
+        self.assertGreater(c._vox_blocked_until, 0.0)
+
     async def test_watchdog_unkeys(self):
         c, ptt = self.make_client()
         await c.handle_message(floor("bbbb", "Dad"))

@@ -419,7 +419,14 @@ class WalkieClient:
 
     def _do_unkey(self):
         self._unkey_handle = None
-        self.ptt.unkey()
+        was_keyed = self.ptt.keyed
+        self.ptt.unkey()  # always write the idle state, as a safety measure
+        if not was_keyed:
+            # Nothing was transmitting, so there is no TX leak to wait out.
+            # Blocking VOX here would cancel our own radio->LAN transmission:
+            # taking the floor calls this, and the block would make VOX report
+            # "stop" right after "start" (the floor flapped on and off).
+            return
         # Squelch tail / TX audio can leak into the input right after unkey.
         self._vox_blocked_until = time.monotonic() + 0.5
         self._status("[radio: TX released]")
