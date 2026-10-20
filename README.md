@@ -12,10 +12,11 @@ that bridges a handheld radio to the channel with an
 - Optional priority node that can interrupt the current speaker.
 - Browser client is plain HTML/CSS/JS with no build step.
 
-> **Status: early, hobby-grade.** The browser mesh and the server have been
-> used on real devices and have automated tests. The radio gateway is
-> implemented and unit-tested but **has not yet been run against real AIOC
-> hardware**. See [Project status](#project-status).
+> **Status: early, hobby-grade, but working end to end.** The browser mesh, the
+> server and the AIOC radio gateway have all been run on real hardware
+> (Ubuntu 24.04, an AIOC, a Baofeng handheld, Chrome and Firefox peers) and have
+> automated tests. It has not had a multi-day soak test yet. See
+> [Project status](#project-status).
 
 ## How it works
 
@@ -129,7 +130,7 @@ Found a problem? See [SECURITY.md](SECURITY.md).
 | Server (floor control, priority, input hardening) | Automated tests (`npm test`) |
 | Browser client | Used on desktop and phones; no automated tests |
 | Headless CLI over WebRTC | Verified against the real server with synthetic audio |
-| AIOC radio gateway | Unit-tested logic only; **no real hardware run yet** |
+| AIOC radio gateway | Run on real hardware: push-to-talk keying, radio audio to browsers and back, with Chrome and Firefox peers, reloads and reconnects. Unit-tested, plus Linux probes (`tools/`) for memory, object lifetime and per-peer audio negotiation. **No multi-day soak test yet** |
 | Roaming between Wi-Fi access points | Reconnect logic present; weak spots on phones were reported and are not fully characterised |
 
 Known limits: audio is half-duplex (one speaker at a time); a denied request is

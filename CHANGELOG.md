@@ -18,6 +18,17 @@
 - Container runs as a non-root user with a read-only filesystem.
 
 ### Fixed
+- Gateway never sent audio to a browser that started the call (its answer came back
+  `a=recvonly`): the sender was labelled Opus payload 96 for everyone, while Chrome offers
+  111. Audio is now encoded once and packetized per peer with that peer's payload number;
+  a second offer from the same browser (it rebuilt its connection) gets a fresh connection.
+- Gateway sent no offer when it had to start the call, because it attached its
+  negotiation listener too late; it also sent an empty first offer.
+- Radio stayed keyed while peers were torn down on signaling loss; it is now unkeyed first.
+- "Radio is talking" flickered: the gateway's own floor grant triggered the post-transmit
+  VOX lockout.
+- VOX never saw radio audio: an idle audio mixer stalled the whole pipeline.
+- Native object-ownership errors when removing peers (ICE wrapper reference count).
 - Gateway grew by about 230 MB/min while a WebRTC peer was connected (OOM-killed within
   an hour). Cause: libnice's UPnP port-mapping path. UPnP is now off by default
   (`--upnp` re-enables it); see `docs/MEMORY_LEAK_AUDIT.md`. Peer teardown also releases

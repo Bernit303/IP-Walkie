@@ -7,9 +7,11 @@ HID device to the host. Flags and the systemd unit are in
 [../cli/README.md](../cli/README.md); this page covers the hardware setup,
 the design and its safety rules.
 
-> **Status:** the gateway logic is unit-tested with GStreamer and the serial
-> port stubbed. It has **not yet been run against a real AIOC or radio**.
-> Items that need confirming on hardware are listed at the end.
+> **Status:** verified on real hardware (Ubuntu 24.04.5, GStreamer 1.24.2,
+> an AIOC on a Baofeng handheld): the radio keys from LAN speech, radio audio
+> reaches browsers and back, and it survives page reloads and reconnects. The
+> logic is also unit-tested with GStreamer and the serial port stubbed. Not yet
+> verified: a multi-day soak, other radios, other AIOC firmware versions.
 
 ## How it works
 
@@ -100,8 +102,31 @@ implemented.
 4. Pull the network cable while the radio is keyed: it must unkey within about
    a second.
 
-## Unverified on hardware
+## What was verified, and what is still open
 
-DTR/RTS polarity on real firmware, the GStreamer `level` message format as
-seen by PyGObject (a text fallback exists), ALSA device naming, VOX tuning and
-transmit audio quality. Reports and fixes welcome.
+Verified on the reference setup:
+
+- **PTT polarity:** DTR=1 / RTS=0 keys the radio; the idle state does not.
+- **ALSA device:** the card shows up as `AllInOneCable`; use
+  `plughw:CARD=AllInOneCable,DEV=0` (check `arecord -l` on your machine).
+- **Levels:** the AIOC's capture and playback volumes default near maximum,
+  which clips. About -15 dB capture and -20 dB playback (`amixer -c <card>
+  cset numid=... <value>`, then `sudo alsactl store`) gave clean audio; the
+  radio's squelch idle floor then sat near -64 dBFS and speech peaked around
+  -17 dBFS, so the default VOX threshold of -40 dBFS works.
+- **Receive detection** works from the audio level. `level` messages parse as
+  `rms=(GValueArray)< a, b >`; the parser accepts that and the older forms.
+- **Browser calls:** each peer gets its own RTP packetizer numbered from its own
+  offer (Chrome offers Opus as payload 111, the gateway's own offers use 96).
+
+Known limits and open items:
+
+- A transmitter that is keyed but silent produces no audio, so the gateway
+  cannot see it (no carrier detect through this cable). The floor is held only
+  while the radio's speaker produces sound, plus the hang time.
+- libnice's automatic UPnP is turned off (see `docs/MEMORY_LEAK_AUDIT.md`);
+  without that the process grew by about 230 MB/min on Ubuntu 24.04.
+- Memory drifts up by a small amount (about 0.15 MB) each time a peer joins and
+  leaves. Not yet measured over days.
+- Only one radio, one firmware version and one cable have been tried. Reports
+  and fixes welcome.
