@@ -189,6 +189,7 @@ class Peer:
         self.priority = priority
         self.webrtcbin = None
         self.tee_pad = None
+        self.send_queue = None  # decouples this peer's sink from the shared capture thread
         self.mixer_pad = None
         self.recv_elements = []  # queue, depay, dec, conv, resample — for cleanup
 
@@ -231,6 +232,7 @@ class WalkieClient:
         self._vox_blocked_until = 0.0
         self.vox_debug = vox_debug
         self._level_msgs = 0
+        self._dbg_status_last = 0
         self._dbg_peak = float("-inf")
         self._dbg_last = time.monotonic()
 
@@ -281,6 +283,8 @@ class WalkieClient:
         if self.vox:
             bus.connect("message::element", self.on_bus_element)
             GLib.timeout_add_seconds(5, self._check_levels_flowing)
+            if self.vox_debug:
+                GLib.timeout_add_seconds(2, self._debug_status)
 
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -288,6 +292,18 @@ class WalkieClient:
         # without a running main loop, error messages are silently never delivered.
         self.glib_loop = GLib.MainLoop()
         threading.Thread(target=self.glib_loop.run, daemon=True).start()
+
+    def _debug_status(self):
+        n = self._level_msgs
+        delta, self._dbg_status_last = n - self._dbg_status_last, n
+        state = self.pipeline.get_state(0)[1].value_nick
+        print(
+            f"[vox] status: {delta} level readings in the last 2 s, pipeline {state}, "
+            f"{len(self.peers)} peer(s), floor holder {self.floor_holder!r}, "
+            f"radio keyed {bool(self.ptt and self.ptt.keyed)}",
+            file=sys.stderr,
+        )
+        return True  # repeat
 
     def _check_levels_flowing(self):
         if self._level_msgs == 0:
@@ -420,11 +436,25 @@ class WalkieClient:
         if initiator:
             webrtcbin.connect("on-negotiation-needed", self.on_negotiation_needed, peer_id)
 
-        # Fan the shared outgoing audio into this peer's connection.
+        # Fan the shared outgoing audio into this peer's connection, through
+        # a small leaky queue. Without it, a peer whose webrtcbin isn't
+        # accepting data yet blocks the single capture streaming thread, which
+        # also starves the level meter VOX depends on (radio -> LAN dies while
+        # LAN -> radio keeps working).
+        send_queue = Gst.ElementFactory.make("queue")
+        send_queue.set_property("leaky", 2)  # downstream: drop oldest, never block
+        send_queue.set_property("max-size-buffers", 0)
+        send_queue.set_property("max-size-bytes", 0)
+        send_queue.set_property("max-size-time", 200_000_000)  # 200 ms
+        self.pipeline.add(send_queue)
+        send_queue.sync_state_with_parent()
+
         tee_pad = self.tee.get_request_pad("src_%u")
+        tee_pad.link(send_queue.get_static_pad("sink"))
         sink_pad = webrtcbin.get_request_pad("sink_%u")
-        tee_pad.link(sink_pad)
+        send_queue.get_static_pad("src").link(sink_pad)
         peer.tee_pad = tee_pad
+        peer.send_queue = send_queue
 
         return webrtcbin
 
@@ -535,6 +565,10 @@ class WalkieClient:
 
         if peer.tee_pad:
             self.tee.release_request_pad(peer.tee_pad)
+
+        if peer.send_queue:
+            peer.send_queue.set_state(Gst.State.NULL)
+            self.pipeline.remove(peer.send_queue)
 
         for el in peer.recv_elements:
             el.set_state(Gst.State.NULL)

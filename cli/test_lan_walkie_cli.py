@@ -116,6 +116,43 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("level name=lvl", launch)
 
 
+class PeerWiringTests(unittest.TestCase):
+    def test_each_peer_gets_a_leaky_queue_between_tee_and_webrtcbin(self):
+        c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
+        c.pipeline = MagicMock()
+        c.tee = MagicMock()
+        made = []
+
+        def make(factory, name=None):
+            el = MagicMock(name=factory)
+            el.factory = factory
+            made.append(el)
+            return el
+
+        cli.Gst.ElementFactory.make.side_effect = make
+        try:
+            peer = cli.Peer("p1", "Dad")
+            c.create_peer_connection(peer, initiator=False)
+        finally:
+            cli.Gst.ElementFactory.make.side_effect = None
+        queues = [e for e in made if e.factory == "queue"]
+        self.assertEqual(len(queues), 1)
+        queues[0].set_property.assert_any_call("leaky", 2)
+        self.assertIs(peer.send_queue, queues[0])
+        # tee pad feeds the queue, not webrtcbin directly
+        c.tee.get_request_pad.return_value.link.assert_called_once_with(queues[0].get_static_pad.return_value)
+
+    def test_remove_peer_releases_the_queue(self):
+        c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
+        c.pipeline, c.tee, c.mixer = MagicMock(), MagicMock(), MagicMock()
+        peer = cli.Peer("p1", "Dad")
+        peer.webrtcbin, peer.tee_pad, peer.send_queue = MagicMock(), MagicMock(), MagicMock()
+        c.peers["p1"] = peer
+        c.remove_peer("p1")
+        peer.send_queue.set_state.assert_called_once()
+        c.pipeline.remove.assert_any_call(peer.send_queue)
+
+
 class SafeTextTests(unittest.TestCase):
     def test_strips_control_and_surrogates(self):
         s = cli.safe_text("Dad\x1b[2J\r\nX\ud800Y")
