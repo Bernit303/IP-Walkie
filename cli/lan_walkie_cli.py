@@ -87,7 +87,7 @@ class Vox:
     back into the input.
     """
 
-    def __init__(self, threshold_db=-40.0, attack_ms=60, hang_ms=800):
+    def __init__(self, threshold_db=-40.0, attack_ms=60, hang_ms=1500):
         self.threshold_db = threshold_db
         self.attack_ms = attack_ms
         self.hang_ms = hang_ms
@@ -264,7 +264,10 @@ class WalkieClient:
             f"capsfilter caps=application/x-rtp,media=audio,encoding-name=OPUS,"
             f"payload=96,clock-rate=48000 ! tee name=t"
         )
-        playback = f"audiomixer name=mix ! audioconvert ! audioresample ! {self.sink}"
+        # latency: with the live keep-alive input the mixer runs in live mode, where
+        # audio arriving later than its deadline is dropped. Network audio always
+        # arrives a little late, so give it 200 ms of slack.
+        playback = f"audiomixer name=mix latency=200000000 ! audioconvert ! audioresample ! {self.sink}"
         # A permanent live silent input keeps the mixer producing output even
         # when no peer is sending. Without it the mixer waits for audio, the
         # sink never prerolls, and the WHOLE pipeline (including the capture
@@ -304,7 +307,30 @@ class WalkieClient:
         else:
             print(text, flush=True)
 
+    def _log_sdp(self, label, sdp_text):
+        """--vox-debug: show the audio lines of an SDP (direction and codec)."""
+        if not self.vox_debug:
+            return
+        keep = ("m=", "a=sendrecv", "a=recvonly", "a=sendonly", "a=inactive", "a=rtpmap", "a=mid")
+        lines = [ln.strip() for ln in sdp_text.splitlines() if ln.startswith(keep)]
+        print(f"[sdp] {label}: " + " | ".join(lines), file=sys.stderr)
+
+    def _on_stats(self, promise, name):
+        """--vox-debug: RTP packet counters from webrtcbin, to see if audio really moves."""
+        try:
+            promise.wait()
+            text = promise.get_reply().to_string()
+            sent = re.findall(r"packets-sent=\(guint64\)(\d+)", text)
+            recv = re.findall(r"packets-received=\(guint64\)(\d+)", text)
+            print(f"[rtp] {name}: packets sent {sent or '-'} received {recv or '-'}", file=sys.stderr)
+        except Exception as e:
+            print(f"[rtp] {name}: stats unavailable ({e})", file=sys.stderr)
+
     def _debug_status(self):
+        for peer in list(self.peers.values()):
+            if peer.webrtcbin is not None:
+                promise = Gst.Promise.new_with_change_func(self._on_stats, safe_text(peer.name, 20))
+                peer.webrtcbin.emit("get-stats", None, promise)
         n = self._level_msgs
         delta, self._dbg_status_last = n - self._dbg_status_last, n
         state = self.pipeline.get_state(0)[1].value_nick
@@ -484,6 +510,7 @@ class WalkieClient:
         promise.wait()
         reply = promise.get_reply()
         offer = reply.get_value("offer")
+        self._log_sdp("our offer", offer.sdp.as_text())
         set_promise = Gst.Promise.new()
         webrtcbin.emit("set-local-description", offer, set_promise)
         set_promise.interrupt()
@@ -496,6 +523,7 @@ class WalkieClient:
         if peer.webrtcbin is None:
             peer.webrtcbin = self.create_peer_connection(peer, initiator=False)
 
+        self._log_sdp("remote offer", sdp_text)
         ok, sdpmsg = GstSdp.SDPMessage.new()
         GstSdp.sdp_message_parse_buffer(sdp_text.encode(), sdpmsg)
         offer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.OFFER, sdpmsg)
@@ -511,6 +539,7 @@ class WalkieClient:
         promise.wait()
         reply = promise.get_reply()
         answer = reply.get_value("answer")
+        self._log_sdp("our answer", answer.sdp.as_text())
         set_promise = Gst.Promise.new()
         peer.webrtcbin.emit("set-local-description", answer, set_promise)
         set_promise.interrupt()
@@ -963,7 +992,7 @@ def main():
         help="Print the radio input level once a second (use it to choose --vox-threshold-db)",
     )
     radio.add_argument("--vox-attack-ms", type=int, default=60)
-    radio.add_argument("--vox-hang-ms", type=int, default=800)
+    radio.add_argument("--vox-hang-ms", type=int, default=1500)
 
     parser.add_argument(
         "--token-file",

@@ -153,6 +153,51 @@ class PeerWiringTests(unittest.TestCase):
         c.pipeline.remove.assert_any_call(peer.send_queue)
 
 
+class DiagnosticsTests(unittest.TestCase):
+    def test_sdp_lines_are_logged_only_in_debug_mode(self):
+        import io
+        from contextlib import redirect_stderr
+
+        sdp = (
+            "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+            "a=rtpmap:111 opus/48000/2\r\na=sendrecv\r\na=ice-ufrag:x\r\n"
+        )
+        quiet = cli.WalkieClient("wss://x", "R", "s", "k", None, "system")
+        loud = cli.WalkieClient("wss://x", "R", "s", "k", None, "system", vox_debug=True)
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            quiet._log_sdp("remote offer", sdp)
+        self.assertEqual(buf.getvalue(), "")
+        with redirect_stderr(buf):
+            loud._log_sdp("remote offer", sdp)
+        out = buf.getvalue()
+        self.assertIn("a=sendrecv", out)
+        self.assertIn("a=rtpmap:111 opus/48000/2", out)
+        self.assertNotIn("ice-ufrag", out)
+
+    def test_stats_counters_are_extracted(self):
+        import io
+        from contextlib import redirect_stderr
+
+        c = cli.WalkieClient("wss://x", "R", "s", "k", None, "system")
+        promise = MagicMock()
+        promise.get_reply.return_value.to_string.return_value = (
+            'x, a=(structure)"outbound-rtp, packets-sent=(guint64)812, bytes-sent=(guint64)9;", '
+            'b=(structure)"inbound-rtp, packets-received=(guint64)40;";'
+        )
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            c._on_stats(promise, "Dad")
+        self.assertIn("sent ['812']", buf.getvalue())
+        self.assertIn("received ['40']", buf.getvalue())
+
+    def test_mixer_has_latency_slack(self):
+        cli.Gst.parse_launch.reset_mock()
+        c = cli.WalkieClient("wss://x", "R", "alsasrc", "alsasink", None, "system", vox=cli.Vox())
+        c.build_pipeline()
+        self.assertIn("audiomixer name=mix latency=200000000", cli.Gst.parse_launch.call_args[0][0])
+
+
 class StatusLineTests(unittest.TestCase):
     def test_non_tty_prints_plain_lines_without_carriage_returns(self):
         import io

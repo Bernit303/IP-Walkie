@@ -86,7 +86,7 @@ explicitly.
 | Direction | Trigger | What happens |
 |---|---|---|
 | LAN → radio | Someone else holds the floor | The AIOC keys PTT (DTR=1, RTS=0) and their audio plays into its sound card. On release it stays keyed `--ptt-tail-ms` (300 ms), then unkeys. |
-| radio → LAN | Radio audio above `--vox-threshold-db` for `--vox-attack-ms` | The gateway requests the floor like any user; if granted, the audio goes to everyone. Released after `--vox-hang-ms` of quiet. |
+| radio → LAN | Radio audio above `--vox-threshold-db` for `--vox-attack-ms` | The gateway requests the floor like any user; if granted, the audio goes to everyone. Released after `--vox-hang-ms` (default 1500) of quiet. |
 
 - **Permission comes first.** The radio is only keyed *after* the server
   announces someone else holds the floor, and the gateway only transmits to
