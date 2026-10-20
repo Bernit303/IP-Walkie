@@ -153,6 +153,19 @@ class PeerWiringTests(unittest.TestCase):
         c.pipeline.remove.assert_any_call(peer.send_queue)
 
 
+class StatusLineTests(unittest.TestCase):
+    def test_non_tty_prints_plain_lines_without_carriage_returns(self):
+        import io
+        from contextlib import redirect_stdout
+
+        c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
+        buf = io.StringIO()  # StringIO.isatty() is False, like a journal or a pipe
+        with redirect_stdout(buf):
+            c._status("[radio: TX keyed]")
+            c._status("[ready]")
+        self.assertEqual(buf.getvalue(), "[radio: TX keyed]\n[ready]\n")
+
+
 class SafeTextTests(unittest.TestCase):
     def test_strips_control_and_surrogates(self):
         s = cli.safe_text("Dad\x1b[2J\r\nX\ud800Y")

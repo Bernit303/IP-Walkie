@@ -293,6 +293,17 @@ class WalkieClient:
         self.glib_loop = GLib.MainLoop()
         threading.Thread(target=self.glib_loop.run, daemon=True).start()
 
+    def _status(self, text):
+        """
+        One-line state changes. On an interactive terminal they overwrite each
+        other in place; everywhere else (systemd/journal, pipes, --vox-debug)
+        each one is its own line, so none are lost or garbled by carriage returns.
+        """
+        if sys.stdout.isatty() and not self.vox_debug:
+            print("\r" + text.ljust(40), end="", flush=True)
+        else:
+            print(text, flush=True)
+
     def _debug_status(self):
         n = self._level_msgs
         delta, self._dbg_status_last = n - self._dbg_status_last, n
@@ -345,7 +356,7 @@ class WalkieClient:
             blocked = True
         event = self.vox.update(level_db, LEVEL_INTERVAL_NS / 1e6, blocked=blocked)
         if event == "start":
-            print("\r[radio: carrier/voice detected]      ", end="", flush=True)
+            self._status("[radio: carrier/voice detected]")
             asyncio.run_coroutine_threadsafe(self.start_talk(), self.loop)
         elif event == "stop":
             asyncio.run_coroutine_threadsafe(self.stop_talk(), self.loop)
@@ -379,7 +390,7 @@ class WalkieClient:
             self._unkey_handle = None
         if not self.ptt.keyed:
             self.ptt.key()
-            print("\r[radio: TX keyed]                    ", end="", flush=True)
+            self._status("[radio: TX keyed]")
         # Watchdog: the server's own transmit timeout should end a floor
         # first; this is the local backstop that guarantees the radio never
         # stays keyed if signaling or a peer misbehaves.
@@ -411,7 +422,7 @@ class WalkieClient:
         self.ptt.unkey()
         # Squelch tail / TX audio can leak into the input right after unkey.
         self._vox_blocked_until = time.monotonic() + 0.5
-        print("\r[radio: TX released]                 ", end="", flush=True)
+        self._status("[radio: TX released]")
 
     # ---------- WebRTC ----------
 
@@ -655,7 +666,7 @@ class WalkieClient:
                 self.mic_mute.set_property("mute", False)
                 # We are the source; the radio must not be transmitting.
                 self.radio_unkey(immediate=True)
-                print("\r[TALKING]                        ", end="", flush=True)
+                self._status("[TALKING]")
             elif self.floor_holder:
                 self.mic_mute.set_property("mute", True)
                 if self.have_floor:
@@ -664,14 +675,14 @@ class WalkieClient:
                 # Someone else is talking: their audio is arriving, send it to the radio.
                 self.radio_key()
                 marker = "[priority] " if msg.get("priority") else ""
-                print(f"\r[{marker}{name} is talking]      ", end="", flush=True)
+                self._status(f"[{marker}{name} is talking]")
             else:
                 self.mic_mute.set_property("mute", True)
                 if self.have_floor:
                     self.have_floor = False
                     self.talking = False
                 self.radio_unkey()
-                print("\r[ready]                          ", end="", flush=True)
+                self._status("[ready]")
             # Note: `talking` is deliberately NOT cleared by a broadcast for
             # someone else's floor when we never held it. A stale broadcast
             # racing our own pending ptt-start would otherwise drop our intent
@@ -680,7 +691,7 @@ class WalkieClient:
         elif mtype == "floor-denied":
             self.talking = False
             self.mic_mute.set_property("mute", True)
-            print(f"\r[{safe_text(msg.get('name'))} is talking]      ", end="", flush=True)
+            self._status(f"[{safe_text(msg.get('name'))} is talking]")
 
         elif mtype == "floor-preempted":
             self.talking = False
