@@ -104,6 +104,18 @@ class LevelParsingTests(unittest.TestCase):
         self.assertIsNone(cli.WalkieClient._level_from_structure(s))
 
 
+class PipelineTests(unittest.TestCase):
+    def test_mixer_has_permanent_silent_input(self):
+        # Regression: an idle audiomixer stalls the whole pipeline, which
+        # starved the capture-side level meter that VOX depends on.
+        cli.Gst.parse_launch.reset_mock()
+        c = cli.WalkieClient("wss://x", "R", "alsasrc", "alsasink", None, "system", vox=cli.Vox())
+        c.build_pipeline()
+        launch = cli.Gst.parse_launch.call_args[0][0]
+        self.assertIn("audiotestsrc is-live=true wave=silence ! mix.", launch)
+        self.assertIn("level name=lvl", launch)
+
+
 class SafeTextTests(unittest.TestCase):
     def test_strips_control_and_surrogates(self):
         s = cli.safe_text("Dad\x1b[2J\r\nX\ud800Y")

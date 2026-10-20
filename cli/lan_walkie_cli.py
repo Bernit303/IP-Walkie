@@ -230,6 +230,7 @@ class WalkieClient:
         self._ptt_watchdog = None
         self._vox_blocked_until = 0.0
         self.vox_debug = vox_debug
+        self._level_msgs = 0
         self._dbg_peak = float("-inf")
         self._dbg_last = time.monotonic()
 
@@ -262,8 +263,13 @@ class WalkieClient:
             f"payload=96,clock-rate=48000 ! tee name=t"
         )
         playback = f"audiomixer name=mix ! audioconvert ! audioresample ! {self.sink}"
+        # A permanent live silent input keeps the mixer producing output even
+        # when no peer is sending. Without it the mixer waits for audio, the
+        # sink never prerolls, and the WHOLE pipeline (including the capture
+        # branch that VOX listens to) stays paused until someone talks.
+        keepalive = "audiotestsrc is-live=true wave=silence ! mix."
 
-        self.pipeline = Gst.parse_launch(f"{capture}  {playback}")
+        self.pipeline = Gst.parse_launch(f"{capture}  {playback}  {keepalive}")
         self.tee = self.pipeline.get_by_name("t")
         self.tee.set_property("allow-not-linked", True)  # fine to have zero peers connected
         self.mixer = self.pipeline.get_by_name("mix")
@@ -274,6 +280,7 @@ class WalkieClient:
         bus.connect("message::error", self.on_bus_error)
         if self.vox:
             bus.connect("message::element", self.on_bus_element)
+            GLib.timeout_add_seconds(5, self._check_levels_flowing)
 
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -281,6 +288,15 @@ class WalkieClient:
         # without a running main loop, error messages are silently never delivered.
         self.glib_loop = GLib.MainLoop()
         threading.Thread(target=self.glib_loop.run, daemon=True).start()
+
+    def _check_levels_flowing(self):
+        if self._level_msgs == 0:
+            print(
+                "[vox] WARNING: no audio-level readings from the input after 5 s — the "
+                "capture device may be stalled, busy or the wrong --alsa-device/--source",
+                file=sys.stderr,
+            )
+        return False  # one-shot
 
     def on_bus_error(self, bus, message):
         err, debug = message.parse_error()
@@ -295,6 +311,7 @@ class WalkieClient:
         level_db = self._level_from_structure(s)
         if level_db is None:
             return
+        self._level_msgs += 1
         if self.vox_debug:
             self._dbg_peak = max(self._dbg_peak, level_db)
             now = time.monotonic()
