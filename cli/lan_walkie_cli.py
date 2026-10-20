@@ -75,6 +75,25 @@ def normalize_pin(pin):
     return re.sub(r"[^0-9a-f]", "", pin.lower())
 
 
+def configure_upnp(webrtcbin, enabled=False):
+    """Configure libnice before candidate gathering starts.
+
+    UPnP is unnecessary on LAN/Tailscale and the Ubuntu 24.04 IGD stack can
+    grow without bound while retrying router port mappings. Keep the ICE
+    wrapper for the element's lifetime: temporary wrappers crashed on 1.24.2.
+    """
+    try:
+        webrtcbin._walkie_ice = webrtcbin.get_property("ice-agent")
+        agent = webrtcbin._walkie_ice.get_property("agent")
+        agent.set_property("upnp", enabled)
+    except Exception as e:
+        # A different GStreamer/libnice may not expose these properties. Keep
+        # running (the connection still works) but say so: on a router with UPnP
+        # the process may then grow without bound.
+        print(f"[warning] could not set libnice UPnP={enabled} ({e}); memory may grow "
+              "on networks whose router offers UPnP", file=sys.stderr)
+
+
 class Vox:
     """
     Voice-activated detection on the radio's audio input. Pure logic, fed
@@ -188,6 +207,8 @@ class Peer:
         self.name = name
         self.priority = priority
         self.webrtcbin = None
+        self.webrtc_sink_pad = None
+        self.signal_handlers = []
         self.tee_pad = None
         self.send_queue = None  # decouples this peer's sink from the shared capture thread
         self.mixer_pad = None
@@ -211,12 +232,14 @@ class WalkieClient:
         ptt_tail_ms=300,
         max_ptt_seconds=90,
         vox_debug=False,
+        upnp=False,
     ):
         self.url = url
         self.name = name
         self.source = source
         self.sink = sink
         self.stun = stun
+        self.upnp = upnp
         self.tls_mode = tls_mode  # "system" | "ca-file" | "pin" | "insecure"
         self.ca_file = ca_file
         self.pin = pin
@@ -483,6 +506,7 @@ class WalkieClient:
         peer_id = peer.id
         webrtcbin = Gst.ElementFactory.make("webrtcbin", f"peer-{peer_id}")
         webrtcbin.set_property("bundle-policy", "max-bundle")
+        configure_upnp(webrtcbin, self.upnp)
         if self.stun:
             webrtcbin.set_property("stun-server", self.stun)
 
@@ -491,16 +515,16 @@ class WalkieClient:
         # started and nobody is listening yet, the gateway never sends its offer
         # and the peer connection never starts (floor messages still work over
         # the server, so it looks half-alive but carries no audio).
-        webrtcbin.connect("on-ice-candidate", self.on_ice_candidate, peer_id)
-        webrtcbin.connect("pad-added", self.on_pad_added, peer)
-        webrtcbin.connect(
+        peer.signal_handlers.append(webrtcbin.connect("on-ice-candidate", self.on_ice_candidate, peer_id))
+        peer.signal_handlers.append(webrtcbin.connect("pad-added", self.on_pad_added, peer))
+        peer.signal_handlers.append(webrtcbin.connect(
             "notify::ice-connection-state",
             lambda wb, _pspec, pid=peer_id: print(
                 f"[ice:{pid}] {wb.get_property('ice-connection-state').value_name}", file=sys.stderr
             ),
-        )
+        ))
         if initiator:
-            webrtcbin.connect("on-negotiation-needed", self.on_negotiation_needed, peer_id)
+            peer.signal_handlers.append(webrtcbin.connect("on-negotiation-needed", self.on_negotiation_needed, peer_id))
 
         self.pipeline.add(webrtcbin)
         webrtcbin.sync_state_with_parent()
@@ -521,6 +545,7 @@ class WalkieClient:
         tee_pad = self.tee.get_request_pad("src_%u")
         tee_pad.link(send_queue.get_static_pad("sink"))
         sink_pad = webrtcbin.get_request_pad("sink_%u")
+        peer.webrtc_sink_pad = sink_pad
         send_queue.get_static_pad("src").link(sink_pad)
         peer.tee_pad = tee_pad
         peer.send_queue = send_queue
@@ -634,8 +659,17 @@ class WalkieClient:
             return
 
         if peer.webrtcbin:
+            # The pad-added closure owns peer, which owns webrtcbin. Explicitly
+            # break this cross-language cycle before removing the element.
+            for handler in peer.signal_handlers:
+                peer.webrtcbin.disconnect(handler)
+            peer.signal_handlers.clear()
             peer.webrtcbin.set_state(Gst.State.NULL)
+            if peer.webrtc_sink_pad is not None:
+                peer.webrtcbin.release_request_pad(peer.webrtc_sink_pad)
+                peer.webrtc_sink_pad = None
             self.pipeline.remove(peer.webrtcbin)
+            peer.webrtcbin = None
 
         if peer.tee_pad:
             self.tee.release_request_pad(peer.tee_pad)
@@ -650,6 +684,11 @@ class WalkieClient:
 
         if peer.mixer_pad:
             self.mixer.release_request_pad(peer.mixer_pad)
+
+        peer.tee_pad = None
+        peer.send_queue = None
+        peer.mixer_pad = None
+        peer.recv_elements.clear()
 
     def reset_for_reconnect(self):
         """
@@ -975,6 +1014,9 @@ def main():
         "note the STUN server sees this machine's public IP)",
     )
 
+    parser.add_argument("--upnp", action="store_true",
+                        help="Enable automatic router port mappings (off by default; unnecessary on LAN/Tailscale)")
+
     tls = parser.add_argument_group("TLS (wss:// is verified against the system CAs by default)")
     tls.add_argument("--ca-file", default=None, help="PEM file to trust, e.g. the server's own certs/cert.pem")
     tls.add_argument(
@@ -1081,6 +1123,7 @@ def main():
         ptt_tail_ms=args.ptt_tail_ms,
         max_ptt_seconds=args.max_ptt_seconds,
         vox_debug=args.vox_debug,
+        upnp=args.upnp,
     )
 
     try:

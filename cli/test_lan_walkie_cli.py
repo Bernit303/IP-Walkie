@@ -117,6 +117,42 @@ class PipelineTests(unittest.TestCase):
 
 
 class PeerWiringTests(unittest.TestCase):
+    def test_upnp_is_disabled_before_pipeline_add(self):
+        c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
+        c.pipeline, c.tee = MagicMock(), MagicMock()
+        wb = MagicMock()
+        queue = MagicMock()
+        ice = wb.get_property.return_value
+        agent = ice.get_property.return_value
+
+        def added(el):
+            if el is wb:
+                agent.set_property.assert_called_once_with("upnp", False)
+                self.assertIs(wb._walkie_ice, ice)
+
+        c.pipeline.add.side_effect = added
+        cli.Gst.ElementFactory.make.side_effect = [wb, queue]
+        try:
+            c.create_peer_connection(cli.Peer("p", "P"), False)
+        finally:
+            cli.Gst.ElementFactory.make.side_effect = None
+
+    def test_upnp_setup_failure_warns_but_does_not_crash(self):
+        import io
+        from contextlib import redirect_stderr
+
+        wb = MagicMock()
+        wb.get_property.side_effect = TypeError("no such property")
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            cli.configure_upnp(wb, False)  # must not raise
+        self.assertIn("could not set libnice UPnP", buf.getvalue())
+
+    def test_upnp_can_be_explicitly_enabled(self):
+        wb = MagicMock()
+        cli.configure_upnp(wb, True)
+        wb._walkie_ice.get_property.return_value.set_property.assert_called_once_with("upnp", True)
+
     def test_each_peer_gets_a_leaky_queue_between_tee_and_webrtcbin(self):
         c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
         c.pipeline = MagicMock()
@@ -172,10 +208,21 @@ class PeerWiringTests(unittest.TestCase):
         c.pipeline, c.tee, c.mixer = MagicMock(), MagicMock(), MagicMock()
         peer = cli.Peer("p1", "Dad")
         peer.webrtcbin, peer.tee_pad, peer.send_queue = MagicMock(), MagicMock(), MagicMock()
+        wb, queue = peer.webrtcbin, peer.send_queue
+        peer.webrtc_sink_pad = sink_pad = MagicMock()
+        peer.signal_handlers = [11, 12, 13]
         c.peers["p1"] = peer
         c.remove_peer("p1")
-        peer.send_queue.set_state.assert_called_once()
-        c.pipeline.remove.assert_any_call(peer.send_queue)
+        queue.set_state.assert_called_once()
+        c.pipeline.remove.assert_any_call(queue)
+        wb.release_request_pad.assert_called_once_with(sink_pad)
+        self.assertEqual(wb.disconnect.call_count, 3)
+        self.assertEqual(peer.signal_handlers, [])
+        self.assertIsNone(peer.webrtcbin)
+        self.assertIsNone(peer.send_queue)
+        self.assertIsNone(peer.webrtc_sink_pad)
+        c.remove_peer("p1")  # repeated removal must not release pads twice
+        wb.release_request_pad.assert_called_once()
 
 
 class DiagnosticsTests(unittest.TestCase):

@@ -18,6 +18,10 @@
 - Container runs as a non-root user with a read-only filesystem.
 
 ### Fixed
+- Gateway grew by about 230 MB/min while a WebRTC peer was connected (OOM-killed within
+  an hour). Cause: libnice's UPnP port-mapping path. UPnP is now off by default
+  (`--upnp` re-enables it); see `docs/MEMORY_LEAK_AUDIT.md`. Peer teardown also releases
+  its signal handlers and WebRTC sink pad.
 - Server crashes on `null` / non-object frames, non-string names and invalid
   UTF-8 frames.
 - Browser could hold the floor open when the button was released before the
