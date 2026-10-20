@@ -22,6 +22,15 @@ is generated), or fix ownership once:
 docker run --rm -v lan-walkie-certs:/c alpine chown -R 1000:1000 /c
 ```
 
+### Settings
+
+Every server setting in `docker-compose.yml` is read from the environment with
+a default, so you can set them in Portainer's *Environment variables* section
+(or an `.env` file beside the compose file) without editing the repository.
+This keeps `PRIORITY_TOKEN` out of git. Variables: `CERT_HOSTNAMES`,
+`CERT_IPS`, `MAX_TRANSMIT_MS`, `MAX_CLIENTS`, `PRIORITY_TOKEN`,
+`ALLOWED_ORIGINS`, `BIND_ADDR`.
+
 ### Certificate names
 
 The server generates a self-signed certificate on first run covering

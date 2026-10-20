@@ -11,17 +11,21 @@ services:
     volumes:
       - lan-walkie-certs:/app/certs
     environment:
+      # Each value can be set in Portainer's "Environment variables" section
+      # (or an .env file next to this compose file); the defaults apply when
+      # unset. Keeping them there keeps secrets out of git.
       - PORT=8443
-      # Uncomment and set these for Docker deployments — the container can't
-      # see the host's real LAN IP/hostname to put in its cert automatically.
-      # - CERT_HOSTNAMES=your-hostname
-      # - CERT_IPS=192.168.1.100
-      # - MAX_TRANSMIT_MS=60000
-      # - MAX_CLIENTS=32
-      # Generate with: openssl rand -hex 24  (16+ chars; placeholders are refused)
-      # - PRIORITY_TOKEN=
+      # The container can't see the host's real LAN IP/hostname, so name them
+      # for the self-signed certificate. Generated once: delete the
+      # lan-walkie-certs volume after changing these.
+      - CERT_HOSTNAMES=${CERT_HOSTNAMES:-}
+      - CERT_IPS=${CERT_IPS:-}
+      - MAX_TRANSMIT_MS=${MAX_TRANSMIT_MS:-60000}
+      - MAX_CLIENTS=${MAX_CLIENTS:-32}
+      # Generate with: openssl rand -hex 24  (16+ chars; unset = priority off)
+      - PRIORITY_TOKEN=${PRIORITY_TOKEN:-}
       # Comma-separated browser origins allowed to open the WebSocket.
-      # - ALLOWED_ORIGINS=https://your-host.your-tailnet.ts.net
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
     read_only: true
     tmpfs:
       - /tmp
