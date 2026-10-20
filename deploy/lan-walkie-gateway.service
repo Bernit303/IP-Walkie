@@ -1,0 +1,49 @@
+# systemd unit for the LAN Walkie AIOC radio gateway.
+#
+# Template: replace @USER@ (a user in the "audio" and "dialout" groups) and
+# @REPO@ (the path of this repository's checkout). Settings that change per
+# site live in /etc/lan-walkie-gateway.env (see gateway.env.example), so this
+# file normally needs no edits. Install steps: cli/README.md.
+
+[Unit]
+Description=LAN Walkie radio gateway (AIOC)
+Documentation=https://github.com/Bernit303/IP-Walkie
+After=network-online.target sound.target
+Wants=network-online.target
+# Never give up restarting: an unattended box should recover on its own.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@USER@
+SupplementaryGroups=audio dialout
+WorkingDirectory=@REPO@
+EnvironmentFile=/etc/lan-walkie-gateway.env
+# $VAR (no braces) is split on spaces, so the TLS/extra settings can hold
+# several arguments; ${VAR} is passed as ONE argument.
+ExecStart=/usr/bin/python3 -u @REPO@/cli/lan_walkie_cli.py ${WALKIE_URL} \
+    --name ${WALKIE_NAME} --aioc --alsa-device ${WALKIE_ALSA} --stun= \
+    $WALKIE_TLS_ARGS $WALKIE_EXTRA_ARGS
+
+Restart=always
+RestartSec=5
+# Ctrl+C semantics: the gateway unkeys the radio and closes the serial port.
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+# Normal use is about 60 MB. If memory ever balloons, systemd kills the
+# service (cgroup limit) and Restart=always brings it back clean.
+MemoryMax=300M
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+# Optional: real-time scheduling for the audio threads. Off by default: on a
+# machine with spare CPU it is not needed, and a runaway real-time thread can
+# make the whole box unresponsive. Uncomment only if you hear underruns.
+#CPUSchedulingPolicy=rr
+#CPUSchedulingPriority=50
+
+[Install]
+WantedBy=multi-user.target

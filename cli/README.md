@@ -133,52 +133,49 @@ client only sends it over a verified connection.
 
 ## Running as a systemd service
 
+The repository ships a unit template and an environment file, so the gateway can
+start at boot and restart itself if it ever dies. It runs straight from your
+checkout, so updating is `git pull` followed by a restart.
+
 ```bash
-sudo tee /etc/systemd/system/lan-walkie-cli.service << 'EOF'
-[Unit]
-Description=LAN Walkie AIOC radio gateway
-After=network-online.target sound.target
-Wants=network-online.target
-StartLimitIntervalSec=0
+cd /path/to/IP-Walkie
+USER_NAME=$(whoami); REPO=$(pwd)
 
-[Service]
-Type=simple
-User=your-username
-SupplementaryGroups=audio dialout
-EnvironmentFile=-/etc/lan-walkie-cli.env
-ExecStart=/usr/bin/python3 /opt/lan-walkie-cli/lan_walkie_cli.py wss://<server>:8443 \
-    --name "Radio" --aioc --alsa-device "plughw:CARD=<aioc-card-name>,DEV=0" \
-    --ca-file /opt/lan-walkie-cli/walkie-cert.pem
-Restart=always
-RestartSec=5
-NoNewPrivileges=true
-CPUSchedulingPolicy=rr
-CPUSchedulingPriority=80
-IOSchedulingClass=realtime
-IOSchedulingPriority=0
-OOMScoreAdjust=-1000
+# 1. Settings (edit the file; keep it mode 600, it may hold the priority token)
+sudo install -m 600 -o root -g root deploy/gateway.env.example /etc/lan-walkie-gateway.env
+sudo nano /etc/lan-walkie-gateway.env
 
-[Install]
-WantedBy=multi-user.target
-EOF
+# 2. The unit, with your user and checkout path filled in
+sed -e "s|@USER@|$USER_NAME|" -e "s|@REPO@|$REPO|" deploy/lan-walkie-gateway.service     | sudo tee /etc/systemd/system/lan-walkie-gateway.service > /dev/null
+sudo systemd-analyze verify /etc/systemd/system/lan-walkie-gateway.service
 
+# 3. Start it now and at every boot
 sudo systemctl daemon-reload
-sudo systemctl enable --now lan-walkie-cli
+sudo systemctl enable --now lan-walkie-gateway
 ```
 
-Put `LAN_WALKIE_TOKEN=...` in `/etc/lan-walkie-cli.env` (mode 600, owned by
-root) if the gateway needs priority.
+Day to day:
+
+```bash
+systemctl status lan-walkie-gateway          # state, memory, recent log lines
+journalctl -u lan-walkie-gateway -f          # live log
+sudo systemctl restart lan-walkie-gateway    # after git pull or editing the env file
+systemctl show lan-walkie-gateway -p MemoryCurrent   # resident memory, for a soak test
+```
+
+What the unit does:
 
 - **`Restart=always`:** the client reconnects to the server by itself with
-  backoff (1 s → 30 s); systemd only covers a crash, including one that
-  exits 0, which `on-failure` would not restart.
-- **Real-time scheduling** (`rr` 80, not `fifo` 99, so a spinning thread
-  can't lock the machine) is a deliberate choice for an
-  always-on box. It is OS scheduling, unrelated to walkie
-  *floor* priority. Drop those five lines if the box also does other work
-  you care about.
-- Space-bar PTT doesn't exist under systemd; in gateway mode the radio is
-  the only trigger.
+  backoff; systemd only covers a crash (including one that exits 0).
+- **`KillSignal=SIGINT`:** a stop is handled like Ctrl+C, so the radio is
+  unkeyed and the serial port closed before the process ends.
+- **`MemoryMax=300M`:** normal use is about 60 MB; a runaway process is killed
+  and restarted clean instead of taking the machine down.
+- **Real-time scheduling is off by default.** The gateway needs little CPU; a
+  runaway real-time thread can make a whole machine unresponsive. The unit has
+  commented lines if you hear audio underruns.
+- Space-bar PTT does not exist under systemd; in gateway mode the radio is the
+  only trigger. Without `--aioc` a service instance is listen-only.
 
 ## Command reference
 
