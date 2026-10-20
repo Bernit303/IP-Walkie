@@ -81,6 +81,12 @@ class LevelParsingTests(unittest.TestCase):
         s.to_string.return_value = "level, endtime=(guint64)1, rms=(double){ -41.2, -39.9 }, peak=(double){ -30 };"
         self.assertEqual(cli.WalkieClient._level_from_structure(s), -39.9)
 
+    def test_fallback_handles_angle_bracket_arrays(self):
+        s = MagicMock()
+        s.get_value.side_effect = TypeError("GValueArray")
+        s.to_string.return_value = "level, endtime=(guint64)1, rms=(double)< -41.2, -35.5 >, peak=(double)< -30 >;"
+        self.assertEqual(cli.WalkieClient._level_from_structure(s), -35.5)
+
     def test_unparseable_returns_none(self):
         s = MagicMock()
         s.get_value.return_value = None
