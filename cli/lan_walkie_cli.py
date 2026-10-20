@@ -326,8 +326,9 @@ class WalkieClient:
         except Exception:
             pass
         # Some PyGObject builds don't convert GValueArray; parse the text form.
-        # Arrays serialise as "< a, b >" (GstValueArray) or "{ a, b }" (GstValueList).
-        m = re.search(r"rms=\(double\)[<{]\s*([^>}]*)[>}]", s.to_string())
+        # Seen on Ubuntu 24.04: "rms=(GValueArray)< -48.4, -48.4 >". Older
+        # builds use (double) and/or { } instead, so accept any type tag.
+        m = re.search(r"rms=\([A-Za-z]+\)[<{]\s*([^>}]*)[>}]", s.to_string())
         if m:
             try:
                 return max(float(v) for v in m.group(1).split(","))

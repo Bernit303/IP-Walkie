@@ -87,6 +87,16 @@ class LevelParsingTests(unittest.TestCase):
         s.to_string.return_value = "level, endtime=(guint64)1, rms=(double)< -41.2, -35.5 >, peak=(double)< -30 >;"
         self.assertEqual(cli.WalkieClient._level_from_structure(s), -35.5)
 
+    def test_real_ubuntu_24_04_message(self):
+        s = MagicMock()
+        s.get_value.side_effect = TypeError("GValueArray")
+        s.to_string.return_value = (
+            "level, endtime=(guint64)200000000, timestamp=(guint64)0, "
+            "rms=(GValueArray)< -48.439406690821514, -48.439406690821514 >, "
+            "peak=(GValueArray)< -46.28105621278533, -46.28105621278533 >;"
+        )
+        self.assertAlmostEqual(cli.WalkieClient._level_from_structure(s), -48.4394, places=3)
+
     def test_unparseable_returns_none(self):
         s = MagicMock()
         s.get_value.return_value = None
