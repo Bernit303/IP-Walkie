@@ -116,6 +116,189 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("level name=lvl", launch)
 
 
+CHROME_OFFER = (
+    "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111 63 9 0 8 13 110 126\r\nc=IN IP4 0.0.0.0\r\n"
+    "a=mid:0\r\na=sendrecv\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:63 red/48000/2\r\n"
+    "a=rtpmap:9 G722/8000\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n"
+    "a=rtpmap:13 CN/8000\r\na=rtpmap:110 telephone-event/48000\r\n"
+)
+
+
+class OfferedPayloadTests(unittest.TestCase):
+    def test_chrome_offer_uses_payload_111(self):
+        self.assertEqual(cli.offered_opus_payload(CHROME_OFFER), 111)
+
+    def test_gateway_style_offer_uses_payload_96(self):
+        sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 96\r\na=sendrecv\r\na=rtpmap:96 OPUS/48000/2\r\n"
+        self.assertEqual(cli.offered_opus_payload(sdp), 96)
+
+    def test_other_dynamic_payload_numbers_are_followed(self):
+        sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 109\r\na=rtpmap:109 opus/48000/2\r\n"
+        self.assertEqual(cli.offered_opus_payload(sdp), 109)
+
+    def test_video_section_is_not_mistaken_for_audio(self):
+        sdp = (
+            "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 100\r\na=rtpmap:100 VP8/90000\r\n"
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n"
+        )
+        self.assertEqual(cli.offered_opus_payload(sdp), 111)
+
+    def test_rejected_audio_section_is_skipped(self):
+        sdp = (
+            "v=0\r\nm=audio 0 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n"
+            "m=audio 9 UDP/TLS/RTP/SAVPF 109\r\na=rtpmap:109 opus/48000/2\r\n"
+        )
+        self.assertEqual(cli.offered_opus_payload(sdp), 109)
+
+    def test_opus_mapping_not_listed_on_the_m_line_is_ignored(self):
+        sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:111 opus/48000/2\r\n"
+        with self.assertRaises(ValueError):
+            cli.offered_opus_payload(sdp)
+
+    def test_offer_without_opus_is_refused(self):
+        with self.assertRaises(ValueError):
+            cli.offered_opus_payload("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n")
+
+
+class PerPeerPayloadTests(unittest.IsolatedAsyncioTestCase):
+    """The shared encoder feeds one RTP packetizer PER PEER, numbered as that peer's offer says."""
+
+    def make_client(self):
+        # the real GstSdp.SDPMessage.new() returns (ok, message)
+        cli.GstSdp.SDPMessage.new.return_value = (True, MagicMock())
+        c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
+        c.pipeline, c.tee = MagicMock(), MagicMock()
+        c.sent = []
+        c._send_threadsafe = c.sent.append
+        return c
+
+    def build(self, c, peer, initiator):
+        made = []
+
+        def make(factory, name=None):
+            el = MagicMock(name=factory)
+            el.factory = factory
+            el.get_property.return_value.get_property.return_value.get_property.return_value = False
+            made.append(el)
+            return el
+
+        cli.Gst.ElementFactory.make.side_effect = make
+        try:
+            c.create_peer_connection(peer, initiator)
+        finally:
+            cli.Gst.ElementFactory.make.side_effect = None
+        return made
+
+    def test_payloader_and_caps_follow_the_peers_payload_number(self):
+        for number in (96, 111, 109):
+            c = self.make_client()
+            peer = cli.Peer("p", "P")
+            peer.opus_payload = number
+            made = self.build(c, peer, initiator=False)
+            pay = next(e for e in made if e.factory == "rtpopuspay")
+            pay.set_property.assert_any_call("pt", number)
+            caps = next(e for e in made if e.factory == "capsfilter")
+            self.assertTrue(caps.set_property.called)
+            cli.Gst.Caps.from_string.assert_called_with(
+                "application/x-rtp,media=audio,encoding-name=OPUS,"
+                f"payload={number},clock-rate=48000,encoding-params=(string)2"
+            )
+
+    def test_each_peer_gets_its_own_payloader(self):
+        c = self.make_client()
+        first, second = cli.Peer("a", "A"), cli.Peer("b", "B")
+        first.opus_payload, second.opus_payload = 111, 96
+        self.build(c, first, initiator=False)
+        self.build(c, second, initiator=False)
+        self.assertIsNot(first.send_payloader, second.send_payloader)
+
+    def test_the_shared_encoder_output_is_not_packetized_before_the_tee(self):
+        cli.Gst.parse_launch.reset_mock()
+        c = cli.WalkieClient("wss://x", "R", "alsasrc", "alsasink", None, "system")
+        c.build_pipeline()
+        launch = cli.Gst.parse_launch.call_args[0][0]
+        self.assertIn("opusenc bitrate=32000 ! tee name=t", launch)
+        self.assertNotIn("rtpopuspay", launch)
+
+    async def test_a_chrome_offer_builds_the_sender_with_payload_111(self):
+        c = self.make_client()
+        c.peers["chrome"] = cli.Peer("chrome", "Chrome")
+        seen = []
+
+        def fake_create(peer, initiator):
+            seen.append((peer.opus_payload, initiator))
+            return MagicMock()
+
+        c.create_peer_connection = fake_create
+        c.handle_offer("chrome", CHROME_OFFER)
+        self.assertEqual(seen, [(111, False)])
+
+    async def test_a_second_offer_from_the_same_browser_starts_a_fresh_connection(self):
+        c = self.make_client()
+        c.peers["chrome"] = cli.Peer("chrome", "Chrome")
+        created = []
+        removed = []
+
+        def fake_create(peer, initiator):
+            created.append(peer)
+            return MagicMock()
+
+        c.create_peer_connection = fake_create
+        c.remove_peer = lambda pid: (removed.append(pid), c.peers.pop(pid))
+        c.handle_offer("chrome", CHROME_OFFER)
+        self.assertEqual(removed, [])
+        c.handle_offer("chrome", CHROME_OFFER)  # the browser rebuilt its connection
+        self.assertEqual(removed, ["chrome"])
+        self.assertEqual(len(created), 2)
+        self.assertIsNot(created[0], created[1])
+
+    async def test_a_changed_payload_number_also_starts_a_fresh_connection(self):
+        c = self.make_client()
+        peer = cli.Peer("x", "X")
+        peer.webrtcbin = MagicMock()
+        peer.opus_payload = 96
+        c.peers["x"] = peer
+        c.create_peer_connection = lambda p, initiator: MagicMock()
+        c.remove_peer = lambda pid: c.peers.pop(pid)
+        c.handle_offer("x", CHROME_OFFER)
+        self.assertEqual(c.peers["x"].opus_payload, 111)
+
+    def test_only_one_offer_is_sent_and_never_before_the_sender_exists(self):
+        c = self.make_client()
+        peer = cli.Peer("p", "P")
+        c.peers["p"] = peer
+        wb = MagicMock()
+        c.on_negotiation_needed(wb, "p")  # sender not ready yet: no empty offer
+        wb.emit.assert_not_called()
+        peer.send_ready = True
+        c.on_negotiation_needed(wb, "p")
+        c.on_negotiation_needed(wb, "p")  # a second notification is coalesced
+        self.assertEqual(wb.emit.call_count, 1)
+
+    def test_ice_that_arrives_before_the_offer_is_kept_and_replayed(self):
+        c = self.make_client()
+        peer = cli.Peer("p", "P")
+        c.peers["p"] = peer
+        c.handle_remote_ice("p", {"candidate": "candidate:1 1 udp 1 10.0.0.2 5000 typ host", "sdpMLineIndex": 0})
+        self.assertEqual(len(peer.pending_ice), 1)
+        for i in range(400):  # a flood cannot grow the buffer without bound
+            c.handle_remote_ice("p", {"candidate": f"candidate:{i}", "sdpMLineIndex": 0})
+        self.assertLessEqual(len(peer.pending_ice), 256)
+
+    async def test_only_the_side_that_must_offer_creates_a_connection_up_front(self):
+        c = self.make_client()
+        c.my_id = "bbb"
+        created = []
+        c.create_peer_connection = lambda peer, initiator: created.append((peer.id, initiator)) or MagicMock()
+        await c.handle_message(json.dumps({"type": "peers", "peers": [
+            {"id": "aaa", "name": "Lower"},   # "bbb" > "aaa": the browser offers, we answer
+            {"id": "ccc", "name": "Higher"},  # "bbb" < "ccc": we offer
+        ]}))
+        self.assertEqual(created, [("ccc", True)])
+        self.assertIn("aaa", c.peers)  # known, but its connection waits for its offer
+
+
 class PeerWiringTests(unittest.TestCase):
     def test_upnp_is_disabled_before_pipeline_add(self):
         c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system")
@@ -131,7 +314,7 @@ class PeerWiringTests(unittest.TestCase):
                 agent.set_property.assert_called_once_with("upnp", False)
 
         c.pipeline.add.side_effect = added
-        cli.Gst.ElementFactory.make.side_effect = [wb, queue]
+        cli.Gst.ElementFactory.make.side_effect = [wb, queue, MagicMock(), MagicMock()]
         try:
             c.create_peer_connection(cli.Peer("p", "P"), False)
         finally:

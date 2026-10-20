@@ -75,6 +75,26 @@ def normalize_pin(pin):
     return re.sub(r"[^0-9a-f]", "", pin.lower())
 
 
+def offered_opus_payload(sdp_text):
+    """Select Opus from the first active audio m-line, not from another track."""
+    in_audio = False
+    formats = set()
+    for raw in sdp_text.splitlines():
+        line = raw.strip()
+        if line.startswith("m="):
+            if in_audio:
+                break
+            fields = line[2:].split()
+            in_audio = len(fields) >= 4 and fields[0] == "audio" and fields[1] != "0"
+            if in_audio:
+                formats = set(fields[3:])
+        elif in_audio:
+            match = re.fullmatch(r"a=rtpmap:(\d+)\s+opus/48000/2", line, re.IGNORECASE)
+            if match and match[1] in formats and 96 <= int(match[1]) <= 127:
+                return int(match[1])
+    raise ValueError("remote offer has no supported Opus audio payload")
+
+
 class UpnpConfigError(RuntimeError):
     """libnice's UPnP could not be switched off (or confirmed off)."""
 
@@ -246,6 +266,13 @@ class Peer:
         self.webrtcbin = None
         self.webrtc_sink_pad = None
         self.signal_handlers = []
+        self.opus_payload = 96
+        self.send_payloader = None
+        self.send_caps = None
+        self.send_ready = False
+        self.offer_started = False
+        self.offer_applied = False  # a remote offer has already been applied to this webrtcbin
+        self.pending_ice = []
         self.tee_pad = None
         self.send_queue = None  # decouples this peer's sink from the shared capture thread
         self.mixer_pad = None
@@ -321,9 +348,7 @@ class WalkieClient:
         capture = (
             f"{self.source} ! audioconvert ! audioresample ! {level}"
             f"volume name=mic-mute mute=true ! "
-            f"opusenc bitrate=32000 ! rtpopuspay pt=96 ! "
-            f"capsfilter caps=application/x-rtp,media=audio,encoding-name=OPUS,"
-            f"payload=96,clock-rate=48000 ! tee name=t"
+            f"opusenc bitrate=32000 ! tee name=t"
         )
         # latency: with the live keep-alive input the mixer runs in live mode, where
         # audio arriving later than its deadline is dropped. Network audio always
@@ -564,7 +589,6 @@ class WalkieClient:
             peer.signal_handlers.append(webrtcbin.connect("on-negotiation-needed", self.on_negotiation_needed, peer_id))
 
         self.pipeline.add(webrtcbin)
-        webrtcbin.sync_state_with_parent()
 
         # Fan the shared outgoing audio into this peer's connection, through
         # a small leaky queue. Without it, a peer whose webrtcbin isn't
@@ -577,19 +601,46 @@ class WalkieClient:
         send_queue.set_property("max-size-bytes", 0)
         send_queue.set_property("max-size-time", 200_000_000)  # 200 ms
         self.pipeline.add(send_queue)
-        send_queue.sync_state_with_parent()
-
-        tee_pad = self.tee.get_request_pad("src_%u")
-        tee_pad.link(send_queue.get_static_pad("sink"))
+        # Encode once, but packetize separately: each peer negotiates its own
+        # RTP payload number (Chrome commonly offers 111, our offers use 96).
+        pay = Gst.ElementFactory.make("rtpopuspay")
+        pay.set_property("pt", peer.opus_payload)
+        caps = Gst.ElementFactory.make("capsfilter")
+        caps.set_property("caps", Gst.Caps.from_string(
+            "application/x-rtp,media=audio,encoding-name=OPUS,"
+            f"payload={peer.opus_payload},clock-rate=48000,encoding-params=(string)2"))
+        self.pipeline.add(pay)
+        self.pipeline.add(caps)
+        send_queue.link(pay)
+        pay.link(caps)
         sink_pad = webrtcbin.get_request_pad("sink_%u")
         peer.webrtc_sink_pad = sink_pad
-        send_queue.get_static_pad("src").link(sink_pad)
-        peer.tee_pad = tee_pad
+        caps.get_static_pad("src").link(sink_pad)
+        peer.send_payloader = pay
+        peer.send_caps = caps
         peer.send_queue = send_queue
+        peer.send_ready = True
+
+        # All pads/caps exist before PLAYING can trigger negotiation. Attach
+        # the live tee only after the entire downstream branch is ready.
+        webrtcbin.sync_state_with_parent()
+        for el in (caps, pay, send_queue):
+            el.sync_state_with_parent()
+        tee_pad = self.tee.get_request_pad("src_%u")
+        tee_pad.link(send_queue.get_static_pad("sink"))
+        peer.tee_pad = tee_pad
+        if initiator:
+            self.on_negotiation_needed(webrtcbin, peer_id)
 
         return webrtcbin
 
     def on_negotiation_needed(self, webrtcbin, peer_id):
+        peer = self.peers.get(peer_id)
+        # This client has one fixed local audio track. Coalesce initial
+        # notifications; never send an empty offer before its sink pad exists.
+        if peer is None or not peer.send_ready or peer.offer_started:
+            return
+        peer.offer_started = True
         if self.vox_debug:
             print(f"[gw] negotiation needed for {peer_id}: sending an offer", file=sys.stderr)
         promise = Gst.Promise.new_with_change_func(self.on_offer_created, webrtcbin, peer_id)
@@ -609,7 +660,22 @@ class WalkieClient:
 
     def handle_offer(self, peer_id, sdp_text):
         peer = self.peers[peer_id]
+        payload = offered_opus_payload(sdp_text)
         if peer.webrtcbin is None:
+            peer.opus_payload = payload
+            peer.webrtcbin = self.create_peer_connection(peer, initiator=False)
+        elif peer.opus_payload != payload or peer.offer_applied:
+            # Start over with a fresh connection when (a) the browser's codec
+            # numbering differs from what our sending branch was built for, or
+            # (b) this is a SECOND offer from the same browser, which happens
+            # when it rebuilds its own connection after a network drop: the new
+            # connection has a new DTLS identity, so the old webrtcbin cannot
+            # take it. The shared encoder and other peers' streams are untouched.
+            name, priority = peer.name, peer.priority
+            self.remove_peer(peer_id)
+            peer = Peer(peer_id, name, priority)
+            self.peers[peer_id] = peer
+            peer.opus_payload = payload
             peer.webrtcbin = self.create_peer_connection(peer, initiator=False)
 
         self._log_sdp("remote offer", sdp_text)
@@ -620,6 +686,11 @@ class WalkieClient:
         set_promise = Gst.Promise.new()
         peer.webrtcbin.emit("set-remote-description", offer, set_promise)
         set_promise.interrupt()
+        peer.offer_applied = True
+
+        for candidate in peer.pending_ice:
+            peer.webrtcbin.emit("add-ice-candidate", candidate[0], candidate[1])
+        peer.pending_ice.clear()
 
         answer_promise = Gst.Promise.new_with_change_func(self.on_answer_created, peer)
         peer.webrtcbin.emit("create-answer", None, answer_promise)
@@ -654,12 +725,16 @@ class WalkieClient:
 
     def handle_remote_ice(self, peer_id, candidate_dict):
         peer = self.peers.get(peer_id)
-        if not peer or not peer.webrtcbin or not isinstance(candidate_dict, dict):
+        if not peer or not isinstance(candidate_dict, dict):
             return
         candidate = candidate_dict.get("candidate")
         mlineindex = candidate_dict.get("sdpMLineIndex", 0)
         if candidate:
-            peer.webrtcbin.emit("add-ice-candidate", mlineindex, candidate)
+            if peer.webrtcbin is None:
+                if len(peer.pending_ice) < 256:
+                    peer.pending_ice.append((mlineindex, candidate))
+            else:
+                peer.webrtcbin.emit("add-ice-candidate", mlineindex, candidate)
 
     def on_pad_added(self, webrtcbin, pad, peer):
         if pad.direction != Gst.PadDirection.SRC:
@@ -714,6 +789,10 @@ class WalkieClient:
         if peer.send_queue:
             peer.send_queue.set_state(Gst.State.NULL)
             self.pipeline.remove(peer.send_queue)
+        for el in (peer.send_payloader, peer.send_caps):
+            if el is not None:
+                el.set_state(Gst.State.NULL)
+                self.pipeline.remove(el)
 
         for el in peer.recv_elements:
             el.set_state(Gst.State.NULL)
@@ -724,6 +803,10 @@ class WalkieClient:
 
         peer.tee_pad = None
         peer.send_queue = None
+        peer.send_payloader = None
+        peer.send_caps = None
+        peer.send_ready = False
+        peer.pending_ice.clear()
         peer.mixer_pad = None
         peer.recv_elements.clear()
 
@@ -786,7 +869,8 @@ class WalkieClient:
                     peer = Peer(p["id"], p["name"], priority=bool(p.get("priority", False)))
                     self.peers[p["id"]] = peer
                     initiator = self.my_id < p["id"]
-                    peer.webrtcbin = self.create_peer_connection(peer, initiator)
+                    if initiator:
+                        peer.webrtcbin = self.create_peer_connection(peer, initiator=True)
                     marker = "[priority] " if peer.priority else ""
                     print(f"-> {marker}{safe_text(p['name'])} joined")
 
