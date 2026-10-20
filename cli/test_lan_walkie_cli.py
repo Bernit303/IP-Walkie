@@ -218,6 +218,25 @@ class DiagnosticsTests(unittest.TestCase):
         peer.webrtcbin.emit.assert_not_called()
         self.assertIn("memory", buf.getvalue())
 
+    def test_status_reports_queue_levels_python_objects_and_threads(self):
+        import io
+        from contextlib import redirect_stderr
+
+        c = cli.WalkieClient("wss://x", "R", "s", "k", None, "system", vox_debug=True)
+        c.pipeline = MagicMock()
+        peer = cli.Peer("p1", "Dad")
+        levels = {"current-level-buffers": 7, "current-level-bytes": 4096}
+        peer.send_queue = MagicMock()
+        peer.send_queue.get_property.side_effect = lambda name: levels[name]
+        c.peers["p1"] = peer
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            c._debug_status()
+        out = buf.getvalue()
+        self.assertIn("send-queue 7 buf/4 KB", out)
+        self.assertIn("python objects", out)
+        self.assertIn("threads", out)
+
     def test_rss_reading_is_an_integer(self):
         self.assertIsInstance(cli.WalkieClient._rss_mb(), int)
 

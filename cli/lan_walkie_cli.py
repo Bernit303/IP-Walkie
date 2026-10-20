@@ -328,6 +328,21 @@ class WalkieClient:
             pass
         return -1
 
+    def _queue_report(self):
+        """--vox-debug: fill level of each peer's audio queues, to spot a backlog."""
+        parts = []
+        for peer in list(self.peers.values()):
+            for label, el in (("send", peer.send_queue), ("recv", peer.recv_elements[0] if peer.recv_elements else None)):
+                if el is None:
+                    continue
+                try:
+                    bufs = el.get_property("current-level-buffers")
+                    kb = el.get_property("current-level-bytes") // 1024
+                    parts.append(f"{label}-queue {bufs} buf/{kb} KB")
+                except Exception:
+                    parts.append(f"{label}-queue ?")
+        return ", ".join(parts) or "no queues"
+
     def _debug_status(self):
         n = self._level_msgs
         delta, self._dbg_status_last = n - self._dbg_status_last, n
@@ -336,7 +351,9 @@ class WalkieClient:
         print(
             f"[vox] status: {delta} level readings in 5 s, input peak {quiet_peak:.1f} dBFS, "
             f"pipeline {state}, {len(self.peers)} peer(s), floor holder {self.floor_holder!r}, "
-            f"radio keyed {bool(self.ptt and self.ptt.keyed)}, memory {self._rss_mb()} MB",
+            f"radio keyed {bool(self.ptt and self.ptt.keyed)}, memory {self._rss_mb()} MB, "
+            f"python objects {sys.getallocatedblocks()}, threads {threading.active_count()}, "
+            f"{self._queue_report()}",
             file=sys.stderr,
         )
         return True  # repeat
