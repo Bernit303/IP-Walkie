@@ -21,6 +21,10 @@ const MAX_CLIENTS = Number(process.env.MAX_CLIENTS) || 32;
 const MAX_MESSAGE_BYTES = 32 * 1024; // SDP offers are a few KB; nothing legitimate is near this
 const MAX_MESSAGES_PER_SECOND = 500; // flood guard, well above a burst of ICE candidates
 const NAME_MAX_CHARS = 24;
+// Dead-connection detection. A phone that roams between access points can
+// vanish without closing its socket; without this it would hold the floor
+// until MAX_TRANSMIT_MS and stay in everyone's peer list.
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS) || 5000;
 const MIN_TOKEN_LENGTH = 16;
 const PLACEHOLDER_TOKENS = new Set(['some-long-random-string', 'changeme', 'change-me', 'secret']);
 
@@ -196,12 +200,13 @@ wss.on('connection', (ws) => {
   }
 
   const id = crypto.randomBytes(8).toString('hex');
-  const me = { ws, name: 'Anon', priority: false, joined: false };
+  const me = { ws, name: 'Anon', priority: false, joined: false, alive: true, appPing: false, lastMsg: Date.now() };
   clients.set(id, me);
 
   // Without a listener, an 'error' event (invalid UTF-8, oversize frame,
   // reset) is thrown by EventEmitter and takes the whole process down.
   ws.on('error', () => ws.terminate());
+  ws.on('pong', () => { me.alive = true; });
 
   send(ws, { type: 'welcome', id });
 
@@ -209,6 +214,15 @@ wss.on('connection', (ws) => {
   let windowCount = 0;
 
   function handle(msg) {
+    // Application-level liveness. Needed because a reverse proxy (e.g.
+    // Tailscale Serve) answers protocol pings itself, which would hide a dead
+    // phone behind it. Browsers send this every few seconds.
+    if (msg.type === 'ping') {
+      me.appPing = true;
+      send(ws, { type: 'pong' });
+      return;
+    }
+
     if (msg.type === 'join') {
       me.name = cleanName(msg.name);
       me.priority = tokenMatches(msg.token);
@@ -261,6 +275,8 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (raw) => {
     const now = Date.now();
+    me.alive = true;
+    me.lastMsg = now;
     if (now - windowStart >= 1000) {
       windowStart = now;
       windowCount = 0;
@@ -293,6 +309,22 @@ wss.on('connection', (ws) => {
     broadcastPeerList();
   });
 });
+
+const heartbeat = setInterval(() => {
+  const now = Date.now();
+  for (const [, c] of clients) {
+    // Browsers ping at the application level, so judge them on that;
+    // everyone else on protocol-level pongs.
+    const stale = c.appPing ? now - c.lastMsg > 2 * HEARTBEAT_MS + 1000 : !c.alive;
+    if (stale) {
+      c.ws.terminate();
+      continue;
+    }
+    c.alive = false;
+    try { c.ws.ping(); } catch { /* socket already going away */ }
+  }
+}, HEARTBEAT_MS);
+heartbeat.unref();
 
 server.listen(PORT, '0.0.0.0', () => {
   const lanIp = detectLocalAddresses().find((ip) => ip !== '127.0.0.1') || 'localhost';

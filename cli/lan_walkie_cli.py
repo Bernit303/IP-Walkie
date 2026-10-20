@@ -209,6 +209,7 @@ class WalkieClient:
         vox=None,
         ptt_tail_ms=300,
         max_ptt_seconds=90,
+        vox_debug=False,
     ):
         self.url = url
         self.name = name
@@ -228,6 +229,9 @@ class WalkieClient:
         self._unkey_handle = None
         self._ptt_watchdog = None
         self._vox_blocked_until = 0.0
+        self.vox_debug = vox_debug
+        self._dbg_peak = float("-inf")
+        self._dbg_last = time.monotonic()
 
         self.ws = None
         self.loop = None
@@ -291,6 +295,16 @@ class WalkieClient:
         level_db = self._level_from_structure(s)
         if level_db is None:
             return
+        if self.vox_debug:
+            self._dbg_peak = max(self._dbg_peak, level_db)
+            now = time.monotonic()
+            if now - self._dbg_last >= 1.0:
+                print(
+                    f"[vox] input peak {self._dbg_peak:6.1f} dBFS (threshold {self.vox.threshold_db:.0f})",
+                    file=sys.stderr,
+                )
+                self._dbg_peak = float("-inf")
+                self._dbg_last = now
         blocked = (self.ptt is not None and self.ptt.keyed) or time.monotonic() < self._vox_blocked_until
         # Don't ask for the floor while someone else holds it or we have no
         # session; the radio audio has nowhere to go.
@@ -872,6 +886,11 @@ def main():
         default=-40.0,
         help="Radio input level (dBFS RMS) that counts as received audio. Squelch must be closed below this.",
     )
+    radio.add_argument(
+        "--vox-debug",
+        action="store_true",
+        help="Print the radio input level once a second (use it to choose --vox-threshold-db)",
+    )
     radio.add_argument("--vox-attack-ms", type=int, default=60)
     radio.add_argument("--vox-hang-ms", type=int, default=800)
 
@@ -934,6 +953,7 @@ def main():
         vox=vox,
         ptt_tail_ms=args.ptt_tail_ms,
         max_ptt_seconds=args.max_ptt_seconds,
+        vox_debug=args.vox_debug,
     )
 
     try:

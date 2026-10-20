@@ -69,6 +69,25 @@ class VoxTests(unittest.TestCase):
         self.assertEqual(v._above_ms, 0)
 
 
+class LevelParsingTests(unittest.TestCase):
+    def test_uses_rms_list(self):
+        s = MagicMock()
+        s.get_value.return_value = [-31.5, -28.0]
+        self.assertEqual(cli.WalkieClient._level_from_structure(s), -28.0)
+
+    def test_falls_back_to_text_form(self):
+        s = MagicMock()
+        s.get_value.side_effect = TypeError("GValueArray")
+        s.to_string.return_value = "level, endtime=(guint64)1, rms=(double){ -41.2, -39.9 }, peak=(double){ -30 };"
+        self.assertEqual(cli.WalkieClient._level_from_structure(s), -39.9)
+
+    def test_unparseable_returns_none(self):
+        s = MagicMock()
+        s.get_value.return_value = None
+        s.to_string.return_value = "level, nothing=(int)1;"
+        self.assertIsNone(cli.WalkieClient._level_from_structure(s))
+
+
 class SafeTextTests(unittest.TestCase):
     def test_strips_control_and_surrogates(self):
         s = cli.safe_text("Dad\x1b[2J\r\nX\ud800Y")

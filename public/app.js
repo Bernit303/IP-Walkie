@@ -5,6 +5,7 @@ let localStream;
 let audioTrack;
 let floorHolder = null; // id of whoever currently holds the channel
 let wantTalk = false; // PTT physically held right now (set before the server grants)
+let lastMsgAt = 0; // last time anything arrived from the server
 const peers = new Map(); // id -> RTCPeerConnection
 const audioEls = new Map();
 let reconnectTimer = null;
@@ -66,18 +67,34 @@ if (savedName) {
   join(savedName);
 }
 
+// Sends only if the current socket is open; a socket we just abandoned must
+// not throw into WebRTC event handlers.
+function wsSend(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
 function connect() {
-  ws = new WebSocket(`wss://${location.host}`);
+  // Events from a socket we've already abandoned (a half-dead one after a
+  // Wi-Fi roam) must never touch current state, so every handler checks that
+  // it still belongs to the live socket.
+  const sock = new WebSocket(`wss://${location.host}`);
+  ws = sock;
+  lastMsgAt = Date.now();
   pttBtn.disabled = true;
 
-  ws.addEventListener('open', () => {
+  sock.addEventListener('open', () => {
+    if (sock !== ws) return;
     statusEl.textContent = 'Connected';
     pttBtn.disabled = false;
     backoff = 1000;
   });
-  ws.addEventListener('close', scheduleReconnect);
+  sock.addEventListener('close', () => {
+    if (sock === ws) scheduleReconnect();
+  });
 
-  ws.addEventListener('message', async (event) => {
+  sock.addEventListener('message', async (event) => {
+    if (sock !== ws) return;
+    lastMsgAt = Date.now();
     let msg;
     try {
       msg = JSON.parse(event.data);
@@ -86,9 +103,11 @@ function connect() {
     }
     if (!msg || typeof msg !== 'object') return;
 
+    if (msg.type === 'pong') return;
+
     if (msg.type === 'welcome') {
       myId = msg.id;
-      ws.send(JSON.stringify({ type: 'join', name: myName }));
+      wsSend({ type: 'join', name: myName });
       return;
     }
 
@@ -105,11 +124,16 @@ function connect() {
     }
 
     if (msg.type === 'offer') {
+      // A second offer from a peer we already negotiated with means it
+      // rebuilt its connection (e.g. after a Wi-Fi roam). Its new connection
+      // has a new DTLS identity, so start fresh instead of renegotiating.
+      const existing = peers.get(msg.from);
+      if (existing && existing.remoteDescription) removePeer(msg.from);
       const pc = peers.get(msg.from) || createPeer(msg.from, false);
       await pc.setRemoteDescription(msg.sdp);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      ws.send(JSON.stringify({ type: 'answer', target: msg.from, sdp: pc.localDescription }));
+      wsSend({ type: 'answer', target: msg.from, sdp: pc.localDescription });
       return;
     }
 
@@ -135,7 +159,7 @@ function connect() {
           // floor straight back instead of holding an open mic until the
           // server's transmit timeout.
           audioTrack.enabled = false;
-          ws.send(JSON.stringify({ type: 'ptt-stop' }));
+          wsSend({ type: 'ptt-stop' });
           return;
         }
         audioTrack.enabled = true;
@@ -166,6 +190,44 @@ function connect() {
     }
   });
 }
+
+// A phone that changes access point often keeps a TCP connection that looks
+// open but carries nothing; the browser can take minutes to notice. Ping the
+// server and treat silence as a dead connection.
+const HEARTBEAT_MS = 4000;
+const DEAD_AFTER_MS = 12000;
+
+function dropSocketAndReconnect() {
+  const dead = ws;
+  ws = null; // handlers of the abandoned socket now ignore themselves
+  if (dead) {
+    try { dead.close(); } catch {}
+  }
+  scheduleReconnect();
+}
+
+setInterval(() => {
+  if (!ws || reconnectTimer) return;
+  if (ws.readyState === WebSocket.OPEN) {
+    if (Date.now() - lastMsgAt > DEAD_AFTER_MS) {
+      dropSocketAndReconnect();
+    } else {
+      try { wsSend({ type: 'ping' }); } catch {}
+    }
+  } else if (ws.readyState === WebSocket.CONNECTING && Date.now() - lastMsgAt > DEAD_AFTER_MS) {
+    dropSocketAndReconnect();
+  }
+}, HEARTBEAT_MS);
+
+// Coming back online / back to the foreground: check right away instead of
+// waiting for the next heartbeat.
+function checkNow() {
+  if (!myName || reconnectTimer) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  lastMsgAt = Math.min(lastMsgAt, Date.now() - DEAD_AFTER_MS + 2000);
+}
+window.addEventListener('online', checkNow);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkNow(); });
 
 // Wi-Fi roaming between rooms/access points looks exactly like a dropped
 // connection to the browser — the previous behavior ("Disconnected — reload
@@ -237,7 +299,7 @@ function createPeer(id, initiator) {
 
   pc.addEventListener('icecandidate', (event) => {
     if (event.candidate) {
-      ws.send(JSON.stringify({ type: 'ice', target: id, candidate: event.candidate }));
+      wsSend({ type: 'ice', target: id, candidate: event.candidate });
     }
   });
 
@@ -248,14 +310,26 @@ function createPeer(id, initiator) {
   // often just a brief packet-loss blip) and escalate to 'failed' themselves
   // if it doesn't resolve — acting earlier would tear down connections that
   // were about to heal on their own.
+  //
+  // Roaming update: 'disconnected' that doesn't heal within a few seconds is
+  // treated like 'failed'. Waiting for the browser to escalate on its own
+  // left phones silent for far too long after switching access points.
+  let disconnectTimer = null;
+  function recover() {
+    if (peers.get(id) !== pc) return; // already replaced
+    removePeer(id);
+    if (myId < id) {
+      createPeer(id, true); // negotiationneeded fires a fresh offer automatically
+    }
+    // Non-initiator side just waits for that new offer, same as first
+    // contact — see the 'offer' handler in connect().
+  }
   pc.addEventListener('iceconnectionstatechange', () => {
+    clearTimeout(disconnectTimer);
     if (pc.iceConnectionState === 'failed') {
-      removePeer(id);
-      if (myId < id) {
-        createPeer(id, true); // negotiationneeded fires a fresh offer automatically
-      }
-      // Non-initiator side just waits for that new offer, same as first
-      // contact — see the 'offer' handler in connect().
+      recover();
+    } else if (pc.iceConnectionState === 'disconnected') {
+      disconnectTimer = setTimeout(recover, 4000);
     }
   });
 
@@ -263,7 +337,7 @@ function createPeer(id, initiator) {
     pc.addEventListener('negotiationneeded', async () => {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      ws.send(JSON.stringify({ type: 'offer', target: id, sdp: pc.localDescription }));
+      wsSend({ type: 'offer', target: id, sdp: pc.localDescription });
     });
   }
 
@@ -296,13 +370,13 @@ function renderPeerList(list) {
 function startTalk() {
   if (!audioTrack || floorHolder || !ws || ws.readyState !== WebSocket.OPEN) return;
   wantTalk = true;
-  ws.send(JSON.stringify({ type: 'ptt-start' }));
+  wsSend({ type: 'ptt-start' });
 }
 
 function stopTalk() {
   wantTalk = false;
   if (!audioTrack || floorHolder !== myId || !ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ type: 'ptt-stop' }));
+  wsSend({ type: 'ptt-stop' });
 }
 
 pttBtn.addEventListener('pointerdown', startTalk);

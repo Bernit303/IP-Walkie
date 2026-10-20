@@ -62,7 +62,7 @@ before(async () => {
   port = await freePort();
   server = spawn('node', ['server.js'], {
     cwd: path.join(__dirname, '..'),
-    env: { ...process.env, PORT: String(port), MAX_TRANSMIT_MS: '1000', PRIORITY_TOKEN: TOKEN, MAX_CLIENTS: '8' },
+    env: { ...process.env, PORT: String(port), MAX_TRANSMIT_MS: '1000', PRIORITY_TOKEN: TOKEN, MAX_CLIENTS: '8', HEARTBEAT_MS: '300' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.exited = false;
@@ -187,4 +187,42 @@ test('relay forwards only whitelisted fields and sets from/name itself', async (
   assert.equal(got.from, a.id);
   assert.equal(got.name, 'Sender');
   assert.equal(got.extra, undefined);
+});
+
+test('app-level ping gets a pong, even before join', async () => {
+  const ws = await open();
+  await waitFor(() => last(ws, 'welcome'));
+  send(ws, { type: 'ping' });
+  assert.ok(await waitFor(() => last(ws, 'pong')));
+});
+
+test('a connection that stops answering protocol pings is dropped and frees the floor', async () => {
+  const watcher = await client('Watcher', null);
+  const ghost = await new Promise((resolve, reject) => {
+    const ws = new WebSocket(`wss://127.0.0.1:${port}`, { rejectUnauthorized: false, autoPong: false });
+    ws.msgs = [];
+    ws.on('message', (d) => ws.msgs.push(JSON.parse(d)));
+    ws.on('open', () => resolve(ws));
+    ws.on('error', reject);
+    sockets.push(ws);
+  });
+  const welcome = await waitFor(() => last(ghost, 'welcome'));
+  send(ghost, { type: 'join', name: 'Ghost' });
+  send(ghost, { type: 'ptt-start' });
+  await waitFor(() => last(watcher, 'floor')?.holder === welcome.id);
+  assert.equal(last(watcher, 'floor').holder, welcome.id);
+  // No pong from the ghost: it must be terminated and the floor released.
+  await waitFor(() => last(watcher, 'floor')?.holder === null, 2500);
+  assert.equal(last(watcher, 'floor').holder, null);
+  await waitFor(() => ghost.readyState === WebSocket.CLOSED, 1000);
+});
+
+test('a browser that pings once then goes silent is dropped', async () => {
+  const watcher = await client('Watcher2', null);
+  const quiet = await client('Quiet', null);
+  send(quiet, { type: 'ping' });
+  await waitFor(() => last(watcher, 'peers')?.peers.some((p) => p.name === 'Quiet'));
+  // Quiet keeps auto-ponging but sends nothing at the app level.
+  const gone = await waitFor(() => !last(watcher, 'peers')?.peers.some((p) => p.name === 'Quiet'), 3500);
+  assert.ok(gone, 'silent app-ping client should be removed from the peer list');
 });
