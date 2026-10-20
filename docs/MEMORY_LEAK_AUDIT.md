@@ -175,3 +175,28 @@ libgupnp 1.6.6-1build3; libsoup 3.4.4-5ubuntu0.9.
 
 Local validation: 35 Python unit tests passed, Python compilation passed, and
 `git diff --check` passed. The 120-second native test exited normally.
+
+## Follow-up: ICE object ownership (measured 21 October 2026)
+
+An independent review of `7955d9c` found GLib criticals
+(`g_object_get_qdata: assertion 'G_IS_OBJECT (object)' failed`) when peers are
+removed. `tools/ice_lifetime_probe.py` creates and destroys 20 `webrtcbin`
+elements per variant, each in a fresh process, on the affected machine
+(GStreamer 1.24.2, python3-gi 3.48.2):
+
+| Variant | GLib criticals | Result |
+| --- | --- | --- |
+| no UPnP change (control) | 0 | clean |
+| wrapper stored on the element (as pushed in `7955d9c`) | 3 | `ice refcount after get=1` |
+| wrapper released after the element is gone | 5 | |
+| wrapper kept forever / plus `ice.ref()` | 2 / 5 | **segfault** |
+| **one extra `g_object_ref`, nothing stored** | **0** | `refcount 1 -> 2`, UPnP readback off, fds/RSS same as control |
+| extra ref + stored on element / released after | 0 / 0 | clean |
+
+Cause: `webrtcbin` creates its ICE object without sinking the floating
+reference, so the PyGObject wrapper takes over that single reference. Whichever
+side releases first leaves the other holding a freed object. The fix gives the
+wrapper its own reference (`configure_upnp`), only when the refcount reads 1, so
+a GStreamer release that fixes this itself is left untouched. If the reference
+cannot be added, or UPnP cannot be confirmed off, the gateway refuses to connect
+(`--upnp` accepts the risk).

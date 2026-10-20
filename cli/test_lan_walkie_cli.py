@@ -129,7 +129,6 @@ class PeerWiringTests(unittest.TestCase):
         def added(el):
             if el is wb:
                 agent.set_property.assert_called_once_with("upnp", False)
-                self.assertIs(wb._walkie_ice, ice)
 
         c.pipeline.add.side_effect = added
         cli.Gst.ElementFactory.make.side_effect = [wb, queue]
@@ -137,6 +136,71 @@ class PeerWiringTests(unittest.TestCase):
             c.create_peer_connection(cli.Peer("p", "P"), False)
         finally:
             cli.Gst.ElementFactory.make.side_effect = None
+
+    # --- ICE object ownership (measured on GStreamer 1.24.2) ---
+
+    class _FakeAgent:
+        def __init__(self):
+            self.props = {"upnp": True}
+
+        def set_property(self, name, value):
+            self.props[name] = value
+
+        def get_property(self, name):
+            return self.props[name]
+
+    class _FakeIce:
+        def __init__(self, refcount):
+            self.__grefcount__ = refcount
+            self.agent = PeerWiringTests._FakeAgent()
+
+        def get_property(self, name):
+            return self.agent
+
+    class _FakeWebrtcbin:
+        def __init__(self, refcount):
+            self.ice = PeerWiringTests._FakeIce(refcount)
+
+        def get_property(self, name):
+            return self.ice
+
+    def test_wrapper_gets_its_own_reference_when_refcount_is_one(self):
+        wb = self._FakeWebrtcbin(1)
+        added = []
+        original = cli._add_gobject_ref
+        cli._add_gobject_ref = added.append
+        try:
+            cli.configure_upnp(wb, False)
+        finally:
+            cli._add_gobject_ref = original
+        self.assertEqual(added, [wb.ice])
+        self.assertFalse(wb.ice.agent.props["upnp"])
+        self.assertFalse(hasattr(wb, "_walkie_ice"), "the wrapper must not be parked on the element")
+
+    def test_no_extra_reference_when_the_wrapper_already_owns_one(self):
+        wb = self._FakeWebrtcbin(2)  # a GStreamer that sinks the reference itself
+        added = []
+        original = cli._add_gobject_ref
+        cli._add_gobject_ref = added.append
+        try:
+            cli.configure_upnp(wb, False)
+        finally:
+            cli._add_gobject_ref = original
+        self.assertEqual(added, [])
+
+    def test_failure_to_add_the_reference_refuses_to_connect(self):
+        wb = self._FakeWebrtcbin(1)
+        original = cli._add_gobject_ref
+
+        def boom(obj):
+            raise OSError("libgobject not found")
+
+        cli._add_gobject_ref = boom
+        try:
+            with self.assertRaises(cli.UpnpConfigError):
+                cli.configure_upnp(wb, False)
+        finally:
+            cli._add_gobject_ref = original
 
     def test_upnp_setup_failure_refuses_to_connect(self):
         # A failed "turn UPnP off" must not look like success: continuing would
@@ -181,7 +245,7 @@ class PeerWiringTests(unittest.TestCase):
     def test_upnp_can_be_explicitly_enabled(self):
         wb = MagicMock()
         cli.configure_upnp(wb, True)
-        wb._walkie_ice.get_property.return_value.set_property.assert_called_once_with("upnp", True)
+        wb.get_property.return_value.get_property.return_value.set_property.assert_called_once_with("upnp", True)
 
     def test_reconnect_unkeys_the_radio_before_any_native_teardown(self):
         # Review finding: peers were torn down (native, potentially blocking)

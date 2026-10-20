@@ -79,6 +79,19 @@ class UpnpConfigError(RuntimeError):
     """libnice's UPnP could not be switched off (or confirmed off)."""
 
 
+def _add_gobject_ref(obj):
+    """g_object_ref() on the C object behind a PyGObject wrapper.
+
+    hash() of a PyGObject wrapper is the address of the object it wraps.
+    """
+    import ctypes
+
+    lib = ctypes.CDLL("libgobject-2.0.so.0")
+    lib.g_object_ref.argtypes = [ctypes.c_void_p]
+    lib.g_object_ref.restype = ctypes.c_void_p
+    lib.g_object_ref(ctypes.c_void_p(hash(obj)))
+
+
 def configure_upnp(webrtcbin, enabled=False):
     """Configure libnice before candidate gathering starts.
 
@@ -89,12 +102,19 @@ def configure_upnp(webrtcbin, enabled=False):
     silently bring the memory growth back. Passing --upnp (enabled=True) means
     the operator accepted libnice's default behaviour, so nothing is enforced.
 
-    The ICE wrapper is kept on the element: a temporary wrapper crashed on
-    1.24.2 during setup.
+    Object ownership (measured on GStreamer 1.24.2, tools/ice_lifetime_probe.py):
+    webrtcbin creates its ICE object without sinking the floating reference, so
+    when PyGObject wraps it the wrapper takes over that single reference
+    (refcount 1). Letting the wrapper go then frees an object webrtcbin still
+    uses, which showed up as GLib "G_IS_OBJECT" criticals (and crashes when the
+    wrapper was kept forever). We give the wrapper its own reference, but only
+    when the refcount really is 1, so a GStreamer that fixes this is left alone.
     """
     try:
-        webrtcbin._walkie_ice = webrtcbin.get_property("ice-agent")
-        agent = webrtcbin._walkie_ice.get_property("agent")
+        ice = webrtcbin.get_property("ice-agent")
+        if getattr(ice, "__grefcount__", None) == 1:
+            _add_gobject_ref(ice)
+        agent = ice.get_property("agent")
         agent.set_property("upnp", enabled)
         actual = agent.get_property("upnp")
     except Exception as e:
