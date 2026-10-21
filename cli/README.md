@@ -109,6 +109,43 @@ HID PTT. VOX plus serial PTT works on every firmware ≥ 1.2.0; firmware older
 than 1.2.0 keyed on DTR alone and would key the radio as soon as the port
 opened, so update it first.
 
+### Software squelch on/off
+
+The only "squelch" the gateway has is the VOX gate above: it decides when what
+the radio hears is sent to the LAN. (The radio's own squelch is a setting on
+the radio.) One switch chooses how much of that gate is used:
+
+| `--squelch` | Gate | Use it when |
+|---|---|---|
+| `on` (default) | -40 dBFS, 60 ms attack, 1.5 s hang, no delay. Exactly the behaviour the gateway has always had. | Normal use. |
+| `off` | -55 dBFS, 20 ms attack, 1.5 s hang, and a 300 ms **pre-roll** (the audio sent to the LAN is delayed by 300 ms so the start of a transmission is not clipped while the floor request is on its way). | You want everything the radio lets through to be sent, and the radio's own squelch is set so its idle noise never opens it. |
+
+Set it for the service in `/etc/lan-walkie-gateway.env` (no change to the unit
+file):
+
+```
+LAN_WALKIE_SQUELCH=off
+```
+
+or run with `--squelch off`. Anything other than `on`/`off` stops the gateway at
+start with a clear error. At start it logs one line with the values in use, for
+example `[software squelch OFF: threshold -55 dBFS, attack 20 ms, hang 1500 ms, pre-roll 300 ms]`.
+
+**Why "off" is not "no gate at all".** The channel is exclusive: to send audio
+the gateway has to hold the floor, and it can only tell "radio is receiving"
+from the audio level. On the reference setup the radio's idle floor sat near
+-64 dBFS even with its squelch closed, so a gate below that would see audio
+forever and keep everyone else off the channel. `off` therefore keeps a small
+threshold 9 dB above that floor, far below speech (about -17 dBFS). If your
+radio's idle noise is higher, the gateway warns after 30 s
+(`the radio input has not gone quiet`); raise it with `--vox-threshold-db`
+(measure with `--vox-debug`) or go back to `on`. Any of `--vox-threshold-db`,
+`--vox-attack-ms`, `--vox-hang-ms`, `--preroll-ms` overrides the preset.
+
+The pre-roll adds 300 ms to the radio → LAN path only; LAN → radio is not
+delayed. If the pre-roll element cannot be created on your GStreamer, the
+gateway says so and runs without it.
+
 ### Tuning VOX
 
 Watch `[radio: carrier/voice detected]` while the radio is idle. If it fires
@@ -187,5 +224,6 @@ What the unit does:
 | `--upnp` | Re-enable libnice's automatic router port mappings, and accept libnice's default behaviour if it can't be switched off. **Off by default** (the gateway refuses to connect if it can't confirm UPnP is off): on Ubuntu 24.04 (libnice 0.1.21 / libgupnp-igd 1.6) UPnP made the process grow by about 230 MB/min while a peer was connected. See `docs/MEMORY_LEAK_AUDIT.md` |
 | `--ca-file`, `--pin-sha256`, `--insecure` | TLS trust, see above |
 | `--aioc`, `--ptt-serial`, `--ptt-tail-ms`, `--max-ptt-seconds` | Radio keying |
+| `--squelch on|off`, `--preroll-ms` | Software squelch preset and pre-roll (also `LAN_WALKIE_SQUELCH`) |
 | `--no-vox`, `--vox-threshold-db`, `--vox-attack-ms`, `--vox-hang-ms` | Radio receive detection |
 | `--token-file` | Priority token |

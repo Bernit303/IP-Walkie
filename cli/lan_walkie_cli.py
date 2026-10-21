@@ -60,6 +60,36 @@ LEVEL_INTERVAL_NS = 20_000_000  # 20 ms level reports for VOX
 # harmonic like the browser's tone does.
 BEEP_PATTERN = [(1568.0, 80), (1046.5, 40), (1568.0, 40), (1318.5, 40)]  # (Hz, ms)
 BEEP_MS = sum(ms for _, ms in BEEP_PATTERN)
+
+# Software squelch. The only "squelch" this program has is the VOX gate that decides
+# when audio from the radio is sent to the LAN; the radio's own squelch is a setting
+# on the radio itself.
+#   on : the gate as it has always been (-40 dBFS, 60 ms attack, 1.5 s hang).
+#   off: almost no software gate, so the radio's own squelch does the filtering.
+#        Not "no threshold at all": on the reference setup the radio's idle floor sits
+#        near -64 dBFS even with its squelch closed (docs/AIOC.md), and a gate below
+#        that would see audio forever and keep the channel occupied. -55 leaves 9 dB
+#        above that floor and is still far below speech (about -17 dBFS). The 300 ms
+#        pre-roll keeps the start of a transmission that arrives while the floor
+#        request is still on its way to the server.
+SQUELCH_PRESETS = {
+    "on": {"threshold_db": -40.0, "attack_ms": 60, "hang_ms": 1500, "preroll_ms": 0},
+    "off": {"threshold_db": -55.0, "attack_ms": 20, "hang_ms": 1500, "preroll_ms": 300},
+}
+STUCK_OPEN_SECONDS = 30  # squelch off: warn if the radio input never goes quiet this long
+
+
+def squelch_settings(mode, threshold_db=None, attack_ms=None, hang_ms=None, preroll_ms=None):
+    """The gate settings for a squelch mode; any value given explicitly wins over the preset."""
+    key = str(mode).strip().lower()
+    if key not in SQUELCH_PRESETS:
+        raise ValueError(f"squelch must be 'on' or 'off', not {mode!r}")
+    settings = dict(SQUELCH_PRESETS[key])
+    for name, value in (("threshold_db", threshold_db), ("attack_ms", attack_ms),
+                        ("hang_ms", hang_ms), ("preroll_ms", preroll_ms)):
+        if value is not None:
+            settings[name] = value
+    return settings
 BEEP_VOLUME = 0.5  # audiotestsrc amplitude; on a gateway this goes out over the radio, tune on hardware
 
 
@@ -305,6 +335,8 @@ class WalkieClient:
         vox_debug=False,
         upnp=False,
         beep_lead_ms=400,
+        preroll_ms=0,
+        squelch="on",
     ):
         self.url = url
         self.name = name
@@ -320,6 +352,10 @@ class WalkieClient:
 
         self.ptt = ptt  # AiocPtt or None
         self.vox = vox  # Vox or None
+        self.preroll_ms = preroll_ms  # radio audio is delayed this long so a late floor grant does not clip it
+        self.squelch = squelch  # "on" | "off", for the log only; the settings are in `vox` and `preroll_ms`
+        self._open_since = None
+        self._open_warned = False
         self.ptt_tail_ms = ptt_tail_ms
         # The beep goes through the same audio buffers as voice, so it reaches the air
         # later than the moment it is started; keep the radio keyed this much longer.
@@ -353,17 +389,28 @@ class WalkieClient:
 
     # ---------- GStreamer setup ----------
 
-    def build_pipeline(self):
+    def _capture_chain(self, with_preroll):
         level = ""
+        preroll = ""
         if self.vox:
             # Before the mute: the radio's audio is measured even while it is
             # not being sent to the LAN, which is exactly when VOX needs it.
             level = f"level name=lvl interval={LEVEL_INTERVAL_NS} post-messages=true ! "
-        capture = (
-            f"{self.source} ! audioconvert ! audioresample ! {level}"
+            if with_preroll and self.preroll_ms > 0:
+                # After the level meter, so VOX still sees the audio live while the audio
+                # that is sent is this much behind. Only the radio -> LAN path pays the delay.
+                ns = int(self.preroll_ms * 1_000_000)
+                preroll = (
+                    f"queue name=preroll max-size-buffers=0 max-size-bytes=0 "
+                    f"max-size-time={ns * 3} min-threshold-time={ns} ! "
+                )
+        return (
+            f"{self.source} ! audioconvert ! audioresample ! {level}{preroll}"
             f"volume name=mic-mute mute=true ! "
             f"opusenc bitrate=32000 ! tee name=t"
         )
+
+    def build_pipeline(self):
         # latency: with the live keep-alive input the mixer runs in live mode, where
         # audio arriving later than its deadline is dropped. Network audio always
         # arrives a little late, so give it 200 ms of slack.
@@ -374,7 +421,15 @@ class WalkieClient:
         # branch that VOX listens to) stays paused until someone talks.
         keepalive = "audiotestsrc is-live=true wave=silence ! mix."
 
-        self.pipeline = Gst.parse_launch(f"{capture}  {playback}  {keepalive}")
+        try:
+            self.pipeline = Gst.parse_launch(f"{self._capture_chain(True)}  {playback}  {keepalive}")
+        except Exception as e:
+            if not (self.vox and self.preroll_ms > 0):
+                raise
+            # The pre-roll is a convenience; never let it stop the gateway from starting.
+            print(f"[pre-roll unavailable ({e}); running without it]", file=sys.stderr)
+            self.preroll_ms = 0
+            self.pipeline = Gst.parse_launch(f"{self._capture_chain(False)}  {playback}  {keepalive}")
         self.tee = self.pipeline.get_by_name("t")
         self.tee.set_property("allow-not-linked", True)  # fine to have zero peers connected
         self.mixer = self.pipeline.get_by_name("mix")
@@ -568,11 +623,35 @@ class WalkieClient:
         if self.ws is None or (self.floor_holder not in (None, self.my_id)):
             blocked = True
         event = self.vox.update(level_db, LEVEL_INTERVAL_NS / 1e6, blocked=blocked)
+        if self.squelch == "off":
+            self._watch_stuck_open()
         if event == "start":
             self._status("[radio: carrier/voice detected]")
             asyncio.run_coroutine_threadsafe(self.start_talk(), self.loop)
         elif event == "stop":
             asyncio.run_coroutine_threadsafe(self.stop_talk(), self.loop)
+
+    def _watch_stuck_open(self):
+        """
+        Squelch off only. If the radio input never goes quiet, the idle noise is above the
+        threshold and the gateway holds the channel for good (the server frees it after its
+        transmit limit, and the gateway just asks again). Say so once per stretch.
+        """
+        now = time.monotonic()
+        if not self.vox.active:
+            self._open_since = None
+            self._open_warned = False
+            return
+        if self._open_since is None:
+            self._open_since = now
+        elif not self._open_warned and now - self._open_since > STUCK_OPEN_SECONDS:
+            self._open_warned = True
+            print(
+                f"[squelch OFF: the radio input has not gone quiet for {STUCK_OPEN_SECONDS} s. The idle noise "
+                f"is probably above the threshold ({self.vox.threshold_db:.0f} dBFS), so the channel stays "
+                f"occupied. Raise it with --vox-threshold-db (see --vox-debug), or set LAN_WALKIE_SQUELCH=on]",
+                file=sys.stderr,
+            )
 
     @staticmethod
     def _level_from_structure(s):
@@ -1120,6 +1199,14 @@ class WalkieClient:
 
         if self.ptt:
             print(f"[ready — radio gateway on {self.ptt.port}, Ctrl+C to quit]")
+            if self.vox:
+                print(
+                    f"[software squelch {self.squelch.upper()}: threshold {self.vox.threshold_db:.0f} dBFS, "
+                    f"attack {self.vox.attack_ms} ms, hang {self.vox.hang_ms} ms, pre-roll {self.preroll_ms} ms]",
+                    flush=True,
+                )
+            else:
+                print("[software squelch: not used, radio audio is not forwarded (--no-vox)]", flush=True)
         elif sys.stdin.isatty():
             print("[ready — space to talk, q to quit]")
             key_queue = asyncio.Queue()
@@ -1286,18 +1373,34 @@ def main():
         help="Only send LAN audio to the radio; do not forward what the radio receives to the LAN",
     )
     radio.add_argument(
+        "--squelch",
+        default=os.environ.get("LAN_WALKIE_SQUELCH", "on"),
+        help="Software squelch (the gate that decides when radio audio goes to the LAN): 'on' (default) keeps "
+        "today's gate; 'off' uses almost no gate and lets the radio's own squelch filter (threshold "
+        f"{SQUELCH_PRESETS['off']['threshold_db']:.0f} dBFS, no attack delay, {SQUELCH_PRESETS['off']['preroll_ms']} ms "
+        "pre-roll). Also read from LAN_WALKIE_SQUELCH.",
+    )
+    radio.add_argument(
         "--vox-threshold-db",
         type=float,
-        default=-40.0,
-        help="Radio input level (dBFS RMS) that counts as received audio. Squelch must be closed below this.",
+        default=None,
+        help="Radio input level (dBFS RMS) that counts as received audio (default -40 with squelch on, "
+        "-55 with squelch off). The radio's squelch must be closed below this.",
     )
     radio.add_argument(
         "--vox-debug",
         action="store_true",
         help="Print the radio input level once a second (use it to choose --vox-threshold-db)",
     )
-    radio.add_argument("--vox-attack-ms", type=int, default=60)
-    radio.add_argument("--vox-hang-ms", type=int, default=1500)
+    radio.add_argument("--vox-attack-ms", type=int, default=None, help="default 60 (squelch on) / 20 (off)")
+    radio.add_argument("--vox-hang-ms", type=int, default=None, help="default 1500")
+    radio.add_argument(
+        "--preroll-ms",
+        type=int,
+        default=None,
+        help="Delay the audio sent to the LAN by this long so the start of a transmission is not clipped "
+        "(default 0 with squelch on, 300 with squelch off)",
+    )
 
     parser.add_argument(
         "--token-file",
@@ -1329,6 +1432,14 @@ def main():
         source = f"alsasrc device={args.alsa_device}"
         sink = f"alsasink device={args.alsa_device}"
 
+    try:
+        gate = squelch_settings(
+            args.squelch, args.vox_threshold_db, args.vox_attack_ms, args.vox_hang_ms, args.preroll_ms
+        )
+    except ValueError as e:
+        parser.error(f"--squelch / LAN_WALKIE_SQUELCH: {e}")
+    squelch_mode = args.squelch.strip().lower()
+
     ptt = None
     vox = None
     port = args.ptt_serial
@@ -1342,7 +1453,7 @@ def main():
     if port:
         ptt = AiocPtt(port)  # opens the port and forces it to the idle (unkeyed) state
         if not args.no_vox:
-            vox = Vox(args.vox_threshold_db, args.vox_attack_ms, args.vox_hang_ms)
+            vox = Vox(gate["threshold_db"], gate["attack_ms"], gate["hang_ms"])
 
     client = WalkieClient(
         url=args.url,
@@ -1361,6 +1472,8 @@ def main():
         vox_debug=args.vox_debug,
         upnp=args.upnp,
         beep_lead_ms=args.beep_lead_ms,
+        preroll_ms=gate["preroll_ms"],
+        squelch=squelch_mode,
     )
 
     try:

@@ -90,7 +90,9 @@ implemented.
 2. **Transmit:** key the radio into a listening second handheld and raise the
    playback level until the audio is clear but not harsh.
 3. **Squelch:** set it so idle noise never opens it, then tune
-   `--vox-threshold-db`. `sudo alsactl store` to persist mixer settings.
+   `--vox-threshold-db`. `sudo alsactl store` to persist mixer settings. To rely
+   on the radio's squelch alone, use the software squelch switch
+   (`--squelch off` / `LAN_WALKIE_SQUELCH=off`, see `cli/README.md`).
 
 ## First tests
 

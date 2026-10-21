@@ -892,5 +892,127 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(c.check_server_identity(ws))
 
 
+class SquelchTests(unittest.TestCase):
+    def make(self, **kw):
+        return cli.WalkieClient("wss://x", "R", "alsasrc", "alsasink", None, "system", **kw)
+
+    def launch_string(self, client):
+        cli.Gst.parse_launch.reset_mock()
+        client.build_pipeline()
+        return cli.Gst.parse_launch.call_args[0][0]
+
+    # ---- the settings
+
+    def test_on_is_exactly_the_gate_as_it_has_always_been(self):
+        self.assertEqual(
+            cli.squelch_settings("on"),
+            {"threshold_db": -40.0, "attack_ms": 60, "hang_ms": 1500, "preroll_ms": 0},
+        )
+        default = cli.Vox()  # the constructor defaults, unchanged by this feature
+        self.assertEqual((default.threshold_db, default.attack_ms, default.hang_ms), (-40.0, 60, 1500))
+
+    def test_off_keeps_a_safety_margin_above_the_measured_idle_floor(self):
+        s = cli.squelch_settings("off")
+        # docs/AIOC.md: the radio's idle floor sat near -64 dBFS with the squelch closed,
+        # so a gate at or below that would keep the channel occupied forever.
+        self.assertGreater(s["threshold_db"], -64 + 6)
+        self.assertLess(s["threshold_db"], -40)
+        self.assertLessEqual(s["attack_ms"], 20)
+        self.assertGreater(s["preroll_ms"], 0)
+
+    def test_explicit_values_win_over_the_preset(self):
+        s = cli.squelch_settings("off", threshold_db=-50.0, hang_ms=800, preroll_ms=0)
+        self.assertEqual((s["threshold_db"], s["hang_ms"], s["preroll_ms"]), (-50.0, 800, 0))
+        self.assertEqual(s["attack_ms"], cli.SQUELCH_PRESETS["off"]["attack_ms"])
+        self.assertEqual(cli.squelch_settings("on", preroll_ms=100)["preroll_ms"], 100)
+
+    def test_mode_is_case_and_space_tolerant_and_anything_else_is_refused(self):
+        self.assertEqual(cli.squelch_settings(" OFF ")["threshold_db"], cli.SQUELCH_PRESETS["off"]["threshold_db"])
+        for bad in ("maybe", "", "0", None):
+            with self.assertRaises(ValueError):
+                cli.squelch_settings(bad)
+
+    # ---- the pipeline
+
+    def test_on_builds_the_same_chain_as_before_with_no_delay(self):
+        launch = self.launch_string(self.make(vox=cli.Vox(), preroll_ms=0, squelch="on"))
+        self.assertNotIn("preroll", launch)
+        self.assertIn(
+            "level name=lvl interval=20000000 post-messages=true ! volume name=mic-mute mute=true ! opusenc bitrate=32000 ! tee name=t",
+            launch,
+        )
+
+    def test_off_delays_only_what_is_sent_never_what_the_gate_listens_to(self):
+        launch = self.launch_string(self.make(vox=cli.Vox(-55, 20, 1500), preroll_ms=300, squelch="off"))
+        self.assertIn("min-threshold-time=300000000", launch)
+        # the level meter comes first, so the gate still reacts to live audio
+        self.assertLess(launch.index("level name=lvl"), launch.index("queue name=preroll"))
+        self.assertLess(launch.index("queue name=preroll"), launch.index("volume name=mic-mute"))
+
+    def test_no_delay_is_added_when_the_radio_audio_is_not_forwarded(self):
+        launch = self.launch_string(self.make(vox=None, preroll_ms=300, squelch="off"))
+        self.assertNotIn("preroll", launch)
+
+    def test_if_the_delay_cannot_be_built_the_gateway_still_starts_without_it(self):
+        c = self.make(vox=cli.Vox(), preroll_ms=300, squelch="off")
+        cli.Gst.parse_launch.reset_mock()
+        cli.Gst.parse_launch.side_effect = [Exception("no such property"), MagicMock()]
+        try:
+            c.build_pipeline()
+        finally:
+            cli.Gst.parse_launch.side_effect = None
+        first, second = (call.args[0] for call in cli.Gst.parse_launch.call_args_list)
+        self.assertIn("preroll", first)
+        self.assertNotIn("preroll", second)
+        self.assertEqual(c.preroll_ms, 0)
+
+    def test_a_failure_with_no_delay_involved_is_not_hidden(self):
+        c = self.make(vox=cli.Vox(), preroll_ms=0)
+        cli.Gst.parse_launch.reset_mock()
+        cli.Gst.parse_launch.side_effect = Exception("real pipeline error")
+        try:
+            with self.assertRaises(Exception):
+                c.build_pipeline()
+        finally:
+            cli.Gst.parse_launch.side_effect = None
+
+    # ---- the stuck-open warning
+
+    def test_warns_once_when_the_radio_input_never_goes_quiet(self):
+        import contextlib
+        import io
+        import time
+
+        c = self.make(vox=cli.Vox(-55, 20, 1500), squelch="off")
+        c.vox.active = True
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            c._watch_stuck_open()                                  # starts the clock
+            c._open_since = time.monotonic() - cli.STUCK_OPEN_SECONDS - 1
+            c._watch_stuck_open()                                  # too long: warns
+            c._watch_stuck_open()                                  # but only once
+        text = err.getvalue()
+        self.assertEqual(text.count("has not gone quiet"), 1)
+        self.assertIn("-55 dBFS", text)
+        self.assertIn("LAN_WALKIE_SQUELCH=on", text)
+
+    def test_going_quiet_resets_the_warning(self):
+        import contextlib
+        import io
+        import time
+
+        c = self.make(vox=cli.Vox(-55, 20, 1500), squelch="off")
+        c.vox.active = True
+        c._watch_stuck_open()
+        c._open_since = time.monotonic() - cli.STUCK_OPEN_SECONDS - 1
+        with contextlib.redirect_stderr(io.StringIO()):
+            c._watch_stuck_open()
+        self.assertTrue(c._open_warned)
+        c.vox.active = False
+        c._watch_stuck_open()
+        self.assertIsNone(c._open_since)
+        self.assertFalse(c._open_warned)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added
+- Software squelch switch for the radio gateway: `--squelch on|off` (or `LAN_WALKIE_SQUELCH`
+  in the service's env file). `on` is the gate exactly as before; `off` uses a much lower
+  threshold (-55 dBFS, kept above the measured -64 dBFS idle floor), no attack delay and a
+  300 ms pre-roll so the radio's own squelch does the filtering. Warns if the input never
+  goes quiet.
 - Structured server log (`docs/LOGGING.md`): timestamped one-line events for connections,
   joins, floor grants/denials/releases/timeouts/preemptions, dropped connections, bad
   frames, floods and certificate errors, plus a periodic summary. Never logs tokens or
