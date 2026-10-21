@@ -304,6 +304,7 @@ class WalkieClient:
         max_ptt_seconds=90,
         vox_debug=False,
         upnp=False,
+        beep_lead_ms=400,
     ):
         self.url = url
         self.name = name
@@ -320,6 +321,9 @@ class WalkieClient:
         self.ptt = ptt  # AiocPtt or None
         self.vox = vox  # Vox or None
         self.ptt_tail_ms = ptt_tail_ms
+        # The beep goes through the same audio buffers as voice, so it reaches the air
+        # later than the moment it is started; keep the radio keyed this much longer.
+        self.beep_lead_ms = beep_lead_ms
         self.max_ptt_seconds = max_ptt_seconds
         self._unkey_handle = None
         self._ptt_watchdog = None
@@ -934,6 +938,7 @@ class WalkieClient:
         if mtype == "welcome":
             self.my_id = msg["id"]
             self.roger_beep = msg.get("rogerBeep") is True
+            print(f"[roger beep: {'ON' if self.roger_beep else 'off'} (server setting)]", flush=True)
             token =self.token if self.verified else None
             await self.send({"type": "join", "name": self.name, "token": token})
 
@@ -996,9 +1001,18 @@ class WalkieClient:
                 # a LAN speaker): that is the one case where it reaches radio
                 # listeners, and the key is held until it has finished.
                 beep_ms = 0
-                if self.roger_beep and previous_holder and (self.ptt is None or self.ptt.keyed):
-                    beep_ms = self.play_roger_beep()
-                self.radio_unkey(extra_ms=beep_ms)
+                if self.roger_beep and previous_holder:
+                    if self.ptt is not None and not self.ptt.keyed:
+                        # Radio-originated transmission: nothing is being relayed to the radio.
+                        self._status("[roger beep skipped: the radio was not keyed]")
+                    else:
+                        beep_ms = self.play_roger_beep()
+                        if beep_ms:
+                            self._status("[roger beep]")
+                        else:
+                            self._status("[roger beep unavailable on this machine]")
+                # Hold the key for the whole beep plus the buffer delay (gateway only).
+                self.radio_unkey(extra_ms=beep_ms + (self.beep_lead_ms if beep_ms else 0))
                 self._status("[ready]")
             # Note: `talking` is deliberately NOT cleared by a broadcast for
             # someone else's floor when we never held it. A stale broadcast
@@ -1258,6 +1272,13 @@ def main():
         help="Serial port that keys the radio via DTR/RTS (e.g. /dev/ttyACM0). Implies gateway mode.",
     )
     radio.add_argument("--ptt-tail-ms", type=int, default=300, help="Keep the radio keyed this long after the floor frees")
+    radio.add_argument(
+        "--beep-lead-ms",
+        type=int,
+        default=400,
+        help="Roger beep: keep the radio keyed this long beyond the beep itself, so it is not cut off "
+        "by audio buffering (raise it if the beep is clipped)",
+    )
     radio.add_argument("--max-ptt-seconds", type=int, default=90, help="Hard local limit on one keyed period")
     radio.add_argument(
         "--no-vox",
@@ -1339,6 +1360,7 @@ def main():
         max_ptt_seconds=args.max_ptt_seconds,
         vox_debug=args.vox_debug,
         upnp=args.upnp,
+        beep_lead_ms=args.beep_lead_ms,
     )
 
     try:

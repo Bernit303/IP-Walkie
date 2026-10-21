@@ -739,7 +739,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     # ---------- roger beep ----------
 
     def make_beep_client(self, roger=True, keyed_gateway=True):
-        c, ptt = self.make_client()
+        c, ptt = self.make_client(beep_lead_ms=100)
         c.beep_gate = MagicMock()
         c.beep_src = MagicMock()
         c.roger_beep = roger
@@ -767,7 +767,10 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.15)
         self.assertTrue(ptt.keyed)
         c.beep_gate.set_property.assert_any_call("mute", False)
-        await asyncio.sleep(cli.BEEP_MS / 1000.0 + 0.15)
+        # still keyed after the beep itself is over: the lead covers audio-buffer delay
+        await asyncio.sleep(cli.BEEP_MS / 1000.0 - 0.1)
+        self.assertTrue(ptt.keyed)
+        await asyncio.sleep(0.3)
         self.assertFalse(ptt.keyed)
         c.beep_gate.set_property.assert_called_with("mute", True)
 
@@ -815,6 +818,26 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         await c.handle_message(floor("aaaa", "Radio"))
         await c.handle_message(floor(None))
         c.beep_gate.set_property.assert_not_called()
+
+    async def test_the_log_says_what_the_beep_did(self):
+        c, _ = self.make_beep_client()
+        c._status = MagicMock()
+        await c.handle_message(floor("bbbb", "Dad"))
+        await c.handle_message(floor(None))
+        c._status.assert_any_call("[roger beep]")
+
+        c2, _ = self.make_beep_client(keyed_gateway=False)
+        c2._status = MagicMock()
+        await c2.handle_message(floor("aaaa", "Radio"))
+        await c2.handle_message(floor(None))
+        c2._status.assert_any_call("[roger beep skipped: the radio was not keyed]")
+
+        c3, _ = self.make_beep_client()
+        c3.beep_gate = None
+        c3._status = MagicMock()
+        await c3.handle_message(floor("bbbb", "Dad"))
+        await c3.handle_message(floor(None))
+        c3._status.assert_any_call("[roger beep unavailable on this machine]")
 
     async def test_missing_beep_branch_is_harmless(self):
         c, ptt = self.make_beep_client()
