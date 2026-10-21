@@ -24,10 +24,22 @@ services:
       - MAX_CLIENTS=${MAX_CLIENTS:-32}
       # Roger beep for every client (browsers, CLI, radio gateway): on/off.
       - ROGER_BEEP=${ROGER_BEEP:-off}
+      # Logging (see docs/LOGGING.md): LOG_LEVEL debug|info|warn|error,
+      # LOG_FORMAT text|json, LOG_STATS_MS = summary line interval (0 = off).
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_FORMAT=${LOG_FORMAT:-text}
+      - LOG_STATS_MS=${LOG_STATS_MS:-300000}
       # Generate with: openssl rand -hex 24  (16+ chars; unset = priority off)
       - PRIORITY_TOKEN=${PRIORITY_TOKEN:-}
       # Comma-separated browser origins allowed to open the WebSocket.
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+    # Docker keeps container logs forever by default; cap them (5 files of 10 MB)
+    # so a chatty day can never fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     read_only: true
     tmpfs:
       - /tmp

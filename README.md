@@ -57,7 +57,7 @@ Requires Node.js 20+ and `openssl` on the path.
 ```bash
 npm ci
 npm start
-# LAN Walkie running on https://<your-ip>:8443
+# ... INFO  listening url="https://<your-ip>:8443"
 ```
 
 Open `https://<your-ip>:8443` on any device on the network, accept the
@@ -91,6 +91,9 @@ Server environment variables (all optional):
 | `MAX_CLIENTS` | `32` | Maximum simultaneous connections |
 | `PRIORITY_TOKEN` | unset | Shared secret (16+ chars) that grants priority/preemption; unset disables priority |
 | `ALLOWED_ORIGINS` | unset | Comma-separated browser origins allowed to open the WebSocket |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`; see [docs/LOGGING.md](docs/LOGGING.md) |
+| `LOG_FORMAT` | `text` | `text`, or `json` for one JSON object per line |
+| `LOG_STATS_MS` | `300000` | Interval of the one-line `stats` summary; `0` turns it off |
 | `ROGER_BEEP` | `off` | `on` makes every client (browsers, CLI, radio gateway) play a short beep when the channel is released. One global switch; restart the server to change it |
 
 Generate a token with `openssl rand -hex 24`. Placeholder or short values are

@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added
+- Structured server log (`docs/LOGGING.md`): timestamped one-line events for connections,
+  joins, floor grants/denials/releases/timeouts/preemptions, dropped connections, bad
+  frames, floods and certificate errors, plus a periodic summary. Never logs tokens or
+  message contents; client-supplied text cannot forge log lines. `LOG_LEVEL`, `LOG_FORMAT`
+  (`text`/`json`), `LOG_STATS_MS`. Container logs are now capped (5 x 10 MB).
 - Roger beep: a short tone when the channel is released, on browsers, the CLI and
   (over the air) the radio gateway. One global switch, `ROGER_BEEP=on` on the server
   (default off), announced to clients in `welcome`.

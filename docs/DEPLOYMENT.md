@@ -29,7 +29,8 @@ a default, so you can set them in Portainer's *Environment variables* section
 (or an `.env` file beside the compose file) without editing the repository.
 This keeps `PRIORITY_TOKEN` out of git. Variables: `CERT_HOSTNAMES`,
 `CERT_IPS`, `MAX_TRANSMIT_MS`, `MAX_CLIENTS`, `PRIORITY_TOKEN`,
-`ALLOWED_ORIGINS`, `ROGER_BEEP`, `BIND_ADDR`.
+`ALLOWED_ORIGINS`, `ROGER_BEEP`, `LOG_LEVEL`, `LOG_FORMAT`, `LOG_STATS_MS`,
+`BIND_ADDR`. What gets logged is described in `LOGGING.md`.
 
 ### Certificate names
 
