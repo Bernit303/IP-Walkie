@@ -21,6 +21,44 @@ const talkEl = document.getElementById('talk');
 
 const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
+// Roger beep. The server decides (ROGER_BEEP) and announces it in `welcome`;
+// off until told otherwise. Played locally with Web Audio when the channel
+// goes from someone talking to free, so it never touches the voice path.
+let rogerBeep = false;
+let beepCtx = null;
+
+// Browsers only allow audio after a user gesture, and a returning visitor
+// auto-joins without one, so unlock on the first touch/click/key instead.
+function unlockBeepAudio() {
+  try {
+    if (!beepCtx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      beepCtx = new Ctx();
+    }
+    if (beepCtx.state === 'suspended') beepCtx.resume().catch(() => {});
+  } catch {}
+}
+for (const evt of ['pointerdown', 'keydown']) window.addEventListener(evt, unlockBeepAudio, { passive: true });
+
+function playRogerBeep() {
+  try {
+    if (!beepCtx || beepCtx.state !== 'running') return; // not unlocked yet: stay silent
+    const t = beepCtx.currentTime;
+    const osc = beepCtx.createOscillator();
+    const gain = beepCtx.createGain();
+    osc.frequency.value = 1000;
+    // Short ramps in and out so the tone doesn't click.
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(0.2, t + 0.01);
+    gain.gain.setValueAtTime(0.2, t + 0.11);
+    gain.gain.linearRampToValueAtTime(0, t + 0.12);
+    osc.connect(gain).connect(beepCtx.destination);
+    osc.start(t);
+    osc.stop(t + 0.13);
+  } catch {}
+}
+
 // The floor is exclusive — you never hear your own remote peers while
 // transmitting, so there's no full-duplex/echo scenario here. Browser echo
 // cancellation/noise suppression/AGC add real processing latency for a
@@ -107,6 +145,7 @@ function connect() {
 
     if (msg.type === 'welcome') {
       myId = msg.id;
+      rogerBeep = msg.rogerBeep === true;
       wsSend({ type: 'join', name: myName });
       return;
     }
@@ -152,6 +191,7 @@ function connect() {
     }
 
     if (msg.type === 'floor') {
+      const previousHolder = floorHolder;
       floorHolder = msg.holder;
       if (floorHolder === myId) {
         if (!wantTalk) {
@@ -173,6 +213,9 @@ function connect() {
         audioTrack.enabled = false;
         pttBtn.classList.remove('active');
         setPttLabel('HOLD TO TALK');
+        // Someone was talking and now nobody is. A hand-over to another
+        // speaker (priority preemption) is not "free", so no beep there.
+        if (rogerBeep && previousHolder) playRogerBeep();
       }
       return;
     }

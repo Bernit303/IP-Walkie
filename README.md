@@ -91,6 +91,7 @@ Server environment variables (all optional):
 | `MAX_CLIENTS` | `32` | Maximum simultaneous connections |
 | `PRIORITY_TOKEN` | unset | Shared secret (16+ chars) that grants priority/preemption; unset disables priority |
 | `ALLOWED_ORIGINS` | unset | Comma-separated browser origins allowed to open the WebSocket |
+| `ROGER_BEEP` | `off` | `on` makes every client (browsers, CLI, radio gateway) play a short beep when the channel is released. One global switch; restart the server to change it |
 
 Generate a token with `openssl rand -hex 24`. Placeholder or short values are
 refused: the server logs an error and runs with priority disabled.

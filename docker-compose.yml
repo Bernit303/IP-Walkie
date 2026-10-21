@@ -22,6 +22,8 @@ services:
       - CERT_IPS=${CERT_IPS:-}
       - MAX_TRANSMIT_MS=${MAX_TRANSMIT_MS:-60000}
       - MAX_CLIENTS=${MAX_CLIENTS:-32}
+      # Roger beep for every client (browsers, CLI, radio gateway): on/off.
+      - ROGER_BEEP=${ROGER_BEEP:-off}
       # Generate with: openssl rand -hex 24  (16+ chars; unset = priority off)
       - PRIORITY_TOKEN=${PRIORITY_TOKEN:-}
       # Comma-separated browser origins allowed to open the WebSocket.

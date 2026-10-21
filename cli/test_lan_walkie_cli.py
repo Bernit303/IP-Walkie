@@ -736,6 +736,99 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         await c.handle_message(json.dumps({"type": "welcome", "id": "aaaa"}))
         self.assertEqual(c.sent[-1]["token"], "secret-token-value")
 
+    # ---------- roger beep ----------
+
+    def make_beep_client(self, roger=True, keyed_gateway=True):
+        c, ptt = self.make_client()
+        c.beep_gate = MagicMock()
+        c.roger_beep = roger
+        if keyed_gateway:
+            ptt.key()
+        return c, ptt
+
+    async def test_welcome_sets_the_beep_switch_from_the_server(self):
+        c, _ = self.make_client()
+        await c.handle_message(json.dumps({"type": "welcome", "id": "aaaa", "rogerBeep": True}))
+        self.assertTrue(c.roger_beep)
+        await c.handle_message(json.dumps({"type": "welcome", "id": "aaaa", "rogerBeep": False}))
+        self.assertFalse(c.roger_beep)
+        # An older server that does not send the field means off, as does a non-boolean.
+        await c.handle_message(json.dumps({"type": "welcome", "id": "aaaa"}))
+        self.assertFalse(c.roger_beep)
+        await c.handle_message(json.dumps({"type": "welcome", "id": "aaaa", "rogerBeep": "yes"}))
+        self.assertFalse(c.roger_beep)
+
+    async def test_beep_plays_when_a_speaker_releases_and_holds_the_key_for_it(self):
+        c, ptt = self.make_beep_client()
+        await c.handle_message(floor("bbbb", "Dad"))
+        await c.handle_message(floor(None))
+        c.beep_gate.set_property.assert_called_with("mute", False)
+        # tail (50 ms) + beep (150 ms): still keyed after the plain tail has passed
+        await asyncio.sleep(0.12)
+        self.assertTrue(ptt.keyed)
+        await asyncio.sleep(0.2)
+        self.assertFalse(ptt.keyed)
+        c.beep_gate.set_property.assert_called_with("mute", True)
+
+    async def test_no_beep_when_switched_off(self):
+        c, ptt = self.make_beep_client(roger=False)
+        await c.handle_message(floor("bbbb", "Dad"))
+        await c.handle_message(floor(None))
+        c.beep_gate.set_property.assert_not_called()
+        await asyncio.sleep(0.15)
+        self.assertFalse(ptt.keyed)  # unkeys after the normal tail, not a longer one
+
+    async def test_no_beep_for_a_handover_between_speakers(self):
+        c, _ = self.make_beep_client()
+        await c.handle_message(floor("bbbb", "Dad"))
+        await c.handle_message(floor("cccc", "Mum", priority=True))
+        c.beep_gate.set_property.assert_not_called()
+
+    async def test_no_beep_on_the_first_floor_message_or_after_a_reconnect(self):
+        c, _ = self.make_beep_client()
+        await c.handle_message(floor(None))  # nobody held it before
+        c.beep_gate.set_property.assert_not_called()
+        await c.handle_message(floor("bbbb", "Dad"))
+        c.reset_for_reconnect()
+        c.beep_gate.set_property.reset_mock()
+        await c.handle_message(floor(None))
+        c.beep_gate.set_property.assert_not_called()
+
+    async def test_gateway_does_not_beep_when_the_radio_is_not_keyed(self):
+        # The radio user held the floor: nothing is being relayed to the radio.
+        c, _ = self.make_beep_client(keyed_gateway=False)
+        await c.handle_message(floor("aaaa", "Radio"))
+        await c.handle_message(floor(None))
+        c.beep_gate.set_property.assert_not_called()
+
+    async def test_missing_beep_branch_is_harmless(self):
+        c, ptt = self.make_beep_client()
+        c.beep_gate = None
+        await c.handle_message(floor("bbbb", "Dad"))
+        await c.handle_message(floor(None))
+        await asyncio.sleep(0.15)
+        self.assertFalse(ptt.keyed)  # plain tail, no extension
+
+    async def test_reconnect_silences_a_playing_beep(self):
+        c, _ = self.make_beep_client()
+        c.reset_for_reconnect()
+        c.beep_gate.set_property.assert_called_with("mute", True)
+
+    def test_failed_beep_branch_leaves_the_rest_of_the_pipeline_alone(self):
+        made = cli.Gst.ElementFactory.make.return_value
+        made.get_static_pad.return_value.link.return_value = cli.Gst.PadLinkReturn.OK
+        c = cli.WalkieClient("wss://x", "R", "alsasrc", "alsasink", None, "system")
+        c.build_pipeline()
+        self.assertIsNotNone(c.beep_gate)
+        # An element that cannot be created disables the beep, nothing else.
+        cli.Gst.ElementFactory.make.return_value = None
+        try:
+            c.beep_gate = None
+            c._build_beep_branch()
+            self.assertIsNone(c.beep_gate)
+        finally:
+            cli.Gst.ElementFactory.make.return_value = made
+
     async def test_non_object_messages_ignored(self):
         c, _ = self.make_client()
         for raw in ("null", "[]", '"x"', "42"):

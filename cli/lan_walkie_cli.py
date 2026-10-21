@@ -54,6 +54,9 @@ AIOC_USB_VID = 0x1209  # per the AIOC firmware-update docs (dfu-util -d 1209:738
 AIOC_USB_PID = 0x7388
 MAX_SIGNALING_BYTES = 256 * 1024  # SDP is a few KB; far above that is not signaling
 LEVEL_INTERVAL_NS = 20_000_000  # 20 ms level reports for VOX
+BEEP_MS = 150  # roger beep length
+BEEP_FREQ_HZ = 1000
+BEEP_VOLUME = 0.25  # audiotestsrc amplitude; kept modest because on a gateway this goes out over the radio
 
 
 def safe_text(value, limit=64):
@@ -331,11 +334,13 @@ class WalkieClient:
         self.talking = False  # we asked for the floor and have not released it
         self.have_floor = False  # the server has granted it to us
         self.floor_holder = None
+        self.roger_beep = False  # the server's global switch, refreshed on every `welcome`
 
         self.pipeline = None
         self.tee = None
         self.mixer = None
         self.mic_mute = None
+        self.beep_gate = None  # None = no beep available (never built, or building it failed)
 
     # ---------- GStreamer setup ----------
 
@@ -365,6 +370,7 @@ class WalkieClient:
         self.tee.set_property("allow-not-linked", True)  # fine to have zero peers connected
         self.mixer = self.pipeline.get_by_name("mix")
         self.mic_mute = self.pipeline.get_by_name("mic-mute")
+        self._build_beep_branch()
 
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
@@ -381,6 +387,54 @@ class WalkieClient:
         # without a running main loop, error messages are silently never delivered.
         self.glib_loop = GLib.MainLoop()
         threading.Thread(target=self.glib_loop.run, daemon=True).start()
+
+    def _build_beep_branch(self):
+        """
+        A muted tone generator feeding the playback mixer, for the roger beep.
+        Built apart from the main pipeline string on purpose: if anything here
+        fails, the beep is simply unavailable and the rest of the pipeline is
+        exactly what it was without this feature.
+        """
+        src = gate = None
+        try:
+            src = Gst.ElementFactory.make("audiotestsrc", "beep-src")
+            gate = Gst.ElementFactory.make("volume", "beep-gate")
+            if src is None or gate is None:
+                raise RuntimeError("audiotestsrc/volume element missing")
+            src.set_property("is-live", True)
+            src.set_property("freq", float(BEEP_FREQ_HZ))
+            src.set_property("volume", BEEP_VOLUME)
+            gate.set_property("mute", True)
+            self.pipeline.add(src)
+            self.pipeline.add(gate)
+            if not src.link(gate):
+                raise RuntimeError("could not link the tone generator")
+            pad = self.mixer.get_request_pad("sink_%u")
+            if pad is None or gate.get_static_pad("src").link(pad) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("could not link the tone generator to the mixer")
+            self.beep_gate = gate
+        except Exception as e:
+            self.beep_gate = None
+            print(f"[roger beep unavailable: {e}]", file=sys.stderr)
+
+    def play_roger_beep(self):
+        """Open the beep gate for BEEP_MS. Returns how long it will sound (0 = nothing played)."""
+        if self.beep_gate is None:
+            return 0
+        try:
+            self.beep_gate.set_property("mute", False)
+        except Exception:
+            return 0
+        self.loop.call_later(BEEP_MS / 1000.0, self._end_beep)
+        return BEEP_MS
+
+    def _end_beep(self):
+        if self.beep_gate is None:
+            return
+        try:
+            self.beep_gate.set_property("mute", True)
+        except Exception:
+            pass
 
     def _status(self, text):
         """
@@ -533,7 +587,8 @@ class WalkieClient:
         print("\n[radio: max PTT time reached — unkeying]", file=sys.stderr)
         self.radio_unkey(immediate=True)
 
-    def radio_unkey(self, immediate=False):
+    def radio_unkey(self, immediate=False, extra_ms=0):
+        """extra_ms: hold the key that much longer, so a roger beep finishes on air."""
         if not self.ptt:
             return
         if self._ptt_watchdog:
@@ -542,11 +597,12 @@ class WalkieClient:
         if self._unkey_handle:
             self._unkey_handle.cancel()
             self._unkey_handle = None
-        if immediate or self.ptt_tail_ms <= 0:
+        tail_ms = self.ptt_tail_ms + extra_ms
+        if immediate or tail_ms <= 0:
             self._do_unkey()
         elif self.ptt.keyed:
             # Short tail so the last syllable isn't cut off at the radio.
-            self._unkey_handle = self.loop.call_later(self.ptt_tail_ms / 1000.0, self._do_unkey)
+            self._unkey_handle = self.loop.call_later(tail_ms / 1000.0, self._do_unkey)
 
     def _do_unkey(self):
         self._unkey_handle = None
@@ -825,6 +881,7 @@ class WalkieClient:
         """
         self.radio_unkey(immediate=True)
         self.mic_mute.set_property("mute", True)
+        self._end_beep()
         self.talking = False
         self.have_floor = False
         if self.vox:
@@ -852,7 +909,8 @@ class WalkieClient:
 
         if mtype == "welcome":
             self.my_id = msg["id"]
-            token = self.token if self.verified else None
+            self.roger_beep = msg.get("rogerBeep") is True
+            token =self.token if self.verified else None
             await self.send({"type": "join", "name": self.name, "token": token})
 
         elif mtype == "peers":
@@ -886,6 +944,7 @@ class WalkieClient:
             self.handle_remote_ice(msg["from"], msg.get("candidate"))
 
         elif mtype == "floor":
+            previous_holder = self.floor_holder
             self.floor_holder = msg.get("holder")
             name = safe_text(msg.get("name"))
             if self.floor_holder == self.my_id:
@@ -908,7 +967,14 @@ class WalkieClient:
                 if self.have_floor:
                     self.have_floor = False
                     self.talking = False
-                self.radio_unkey()
+                # Roger beep: someone was talking and now nobody is. On a
+                # gateway it only makes sense while the radio is keyed (relaying
+                # a LAN speaker): that is the one case where it reaches radio
+                # listeners, and the key is held until it has finished.
+                beep_ms = 0
+                if self.roger_beep and previous_holder and (self.ptt is None or self.ptt.keyed):
+                    beep_ms = self.play_roger_beep()
+                self.radio_unkey(extra_ms=beep_ms)
                 self._status("[ready]")
             # Note: `talking` is deliberately NOT cleared by a broadcast for
             # someone else's floor when we never held it. A stale broadcast

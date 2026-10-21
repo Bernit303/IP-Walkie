@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### Added
+- Roger beep: a short tone when the channel is released, on browsers, the CLI and
+  (over the air) the radio gateway. One global switch, `ROGER_BEEP=on` on the server
+  (default off), announced to clients in `welcome`.
 - AIOC radio gateway mode in the CLI (`--aioc`, `--ptt-serial`): serial
   DTR/RTS PTT, VOX for received audio, floor-gated keying with local watchdog.
 - Server limits: message size, message rate and connection cap; optional

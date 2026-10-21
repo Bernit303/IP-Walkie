@@ -226,3 +226,51 @@ test('a browser that pings once then goes silent is dropped', async () => {
   const gone = await waitFor(() => !last(watcher, 'peers')?.peers.some((p) => p.name === 'Quiet'), 3500);
   assert.ok(gone, 'silent app-ping client should be removed from the peer list');
 });
+
+// Starts a throwaway server with extra env and resolves with its welcome message.
+async function welcomeFrom(extraEnv) {
+  const p = await freePort();
+  const child = spawn('node', ['server.js'], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, PORT: String(p), ...extraEnv },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('server did not start')), 15000);
+      child.stdout.on('data', (d) => {
+        if (String(d).includes('running on')) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      child.on('exit', () => reject(new Error('server exited during start')));
+    });
+    return await new Promise((resolve, reject) => {
+      const ws = new WebSocket(`wss://127.0.0.1:${p}`, { rejectUnauthorized: false });
+      ws.on('message', (d) => {
+        const m = JSON.parse(d);
+        if (m.type === 'welcome') {
+          ws.terminate();
+          resolve(m);
+        }
+      });
+      ws.on('error', reject);
+    });
+  } finally {
+    child.kill();
+  }
+}
+
+test('roger beep is announced as off by default', async () => {
+  const ws = await open();
+  const welcome = await waitFor(() => last(ws, 'welcome'));
+  assert.equal(welcome.rogerBeep, false);
+});
+
+test('ROGER_BEEP turns the announcement on; junk values leave it off', async () => {
+  assert.equal((await welcomeFrom({ ROGER_BEEP: 'on' })).rogerBeep, true);
+  assert.equal((await welcomeFrom({ ROGER_BEEP: 'TRUE' })).rogerBeep, true);
+  assert.equal((await welcomeFrom({ ROGER_BEEP: 'off' })).rogerBeep, false);
+  assert.equal((await welcomeFrom({ ROGER_BEEP: 'banana' })).rogerBeep, false);
+});

@@ -15,11 +15,19 @@ actually uses.
 Sent immediately on connect.
 
 ```json
-{ "type": "welcome", "id": "lt7qe9dv" }
+{ "type": "welcome", "id": "lt7qe9dv", "rogerBeep": false }
 ```
 
 `id` is a random string, generated per-connection, used as this
 participant's identity for the rest of the session.
+
+`rogerBeep` is the server's global roger-beep switch (`ROGER_BEEP`). Clients
+treat anything other than the boolean `true` (including a missing field, from
+an older server) as off. When on, a client plays a short beep when a `floor`
+message with `holder: null` follows one that named a holder — i.e. the channel
+went from someone talking to free, however that happened (release, timeout,
+disconnect). A hand-over to another speaker (preemption) is not a beep. The
+beep is generated locally; nothing is added to the audio streams.
 
 ### `join` (client → server)
 

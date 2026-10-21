@@ -25,6 +25,10 @@ const NAME_MAX_CHARS = 24;
 // vanish without closing its socket; without this it would hold the floor
 // until MAX_TRANSMIT_MS and stay in everyone's peer list.
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS) || 5000;
+// Roger beep: a short courtesy tone every client plays when the channel goes
+// from "someone is talking" to free. One global switch, off unless asked for;
+// the server only announces it (in `welcome`) and never touches audio.
+const ROGER_BEEP = ['1', 'true', 'on', 'yes'].includes(String(process.env.ROGER_BEEP || '').trim().toLowerCase());
 const MIN_TOKEN_LENGTH = 16;
 const PLACEHOLDER_TOKENS = new Set(['some-long-random-string', 'changeme', 'change-me', 'secret']);
 
@@ -208,7 +212,7 @@ wss.on('connection', (ws) => {
   ws.on('error', () => ws.terminate());
   ws.on('pong', () => { me.alive = true; });
 
-  send(ws, { type: 'welcome', id });
+  send(ws, { type: 'welcome', id, rogerBeep: ROGER_BEEP });
 
   let windowStart = Date.now();
   let windowCount = 0;
@@ -329,4 +333,5 @@ heartbeat.unref();
 server.listen(PORT, '0.0.0.0', () => {
   const lanIp = detectLocalAddresses().find((ip) => ip !== '127.0.0.1') || 'localhost';
   console.log(`LAN Walkie running on https://${lanIp}:${PORT}`);
+  console.log(`Roger beep: ${ROGER_BEEP ? 'ON' : 'off'}`);
 });
