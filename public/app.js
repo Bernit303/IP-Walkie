@@ -24,8 +24,27 @@ const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 // Roger beep. The server decides (ROGER_BEEP) and announces it in `welcome`;
 // off until told otherwise. Played locally with Web Audio when the channel
 // goes from someone talking to free, so it never touches the voice path.
+//
+// A MOTOTRBO-style talk-permit warble: four back-to-back notes (G6 C6 G6 E6,
+// 200 ms in all). cli/lan_walkie_cli.py plays the same notes (BEEP_PATTERN);
+// change both together.
+const BEEP_PATTERN = [
+  { freq: 1568, ms: 80 },
+  { freq: 1046.5, ms: 40 },
+  { freq: 1568, ms: 40 },
+  { freq: 1318.5, ms: 40 },
+];
+const BEEP_LEVEL = 0.7;
 let rogerBeep = false;
 let beepCtx = null;
+const beepHintEl = document.getElementById('beep-hint');
+
+// Shown while the beep is on but the browser is still blocking sound: without
+// this a phone that only listens would stay silent and nobody would know why.
+function updateBeepHint() {
+  const locked = rogerBeep && (!beepCtx || beepCtx.state !== 'running');
+  beepHintEl.classList.toggle('hidden', !locked);
+}
 
 // Browsers only allow audio after a user gesture, and a returning visitor
 // auto-joins without one, so unlock on the first touch/click/key instead.
@@ -35,27 +54,50 @@ function unlockBeepAudio() {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return;
       beepCtx = new Ctx();
+      beepCtx.onstatechange = updateBeepHint;
     }
-    if (beepCtx.state === 'suspended') beepCtx.resume().catch(() => {});
+    if (beepCtx.state !== 'running') beepCtx.resume().then(updateBeepHint, () => {});
+    updateBeepHint();
   } catch {}
 }
-for (const evt of ['pointerdown', 'keydown']) window.addEventListener(evt, unlockBeepAudio, { passive: true });
+for (const evt of ['pointerdown', 'touchend', 'keydown', 'click']) {
+  window.addEventListener(evt, unlockBeepAudio, { passive: true });
+}
 
 function playRogerBeep() {
   try {
     if (!beepCtx || beepCtx.state !== 'running') return; // not unlocked yet: stay silent
-    const t = beepCtx.currentTime;
+    // One oscillator for the whole warble, so the phase stays continuous when
+    // the pitch jumps (separate oscillators would click at every change).
+    // Fundamental plus a little third harmonic gives it a small speaker's bite.
+    const wave = beepCtx.createPeriodicWave(new Float32Array(4), new Float32Array([0, 0.93, 0, 0.07]));
     const osc = beepCtx.createOscillator();
-    const gain = beepCtx.createGain();
-    osc.frequency.value = 1000;
-    // Short ramps in and out so the tone doesn't click.
-    gain.gain.setValueAtTime(0, t);
-    gain.gain.linearRampToValueAtTime(0.2, t + 0.01);
-    gain.gain.setValueAtTime(0.2, t + 0.11);
-    gain.gain.linearRampToValueAtTime(0, t + 0.12);
-    osc.connect(gain).connect(beepCtx.destination);
-    osc.start(t);
-    osc.stop(t + 0.13);
+    osc.setPeriodicWave(wave);
+    const env = beepCtx.createGain();
+    // 300-3400 Hz band, like a handheld's speaker path.
+    const hp = beepCtx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 300;
+    const lp = beepCtx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 3400;
+    const out = beepCtx.createGain();
+    out.gain.value = BEEP_LEVEL;
+    osc.connect(env).connect(hp).connect(lp).connect(out).connect(beepCtx.destination);
+
+    const start = beepCtx.currentTime + 0.01;
+    let t = start;
+    for (const note of BEEP_PATTERN) {
+      osc.frequency.setValueAtTime(note.freq, t);
+      t += note.ms / 1000;
+    }
+    // 2 ms fades at each end so the warble doesn't click.
+    env.gain.setValueAtTime(0, start);
+    env.gain.linearRampToValueAtTime(1, start + 0.002);
+    env.gain.setValueAtTime(1, t - 0.002);
+    env.gain.linearRampToValueAtTime(0, t);
+    osc.start(start);
+    osc.stop(t + 0.02);
   } catch {}
 }
 
@@ -146,6 +188,7 @@ function connect() {
     if (msg.type === 'welcome') {
       myId = msg.id;
       rogerBeep = msg.rogerBeep === true;
+      updateBeepHint();
       wsSend({ type: 'join', name: myName });
       return;
     }

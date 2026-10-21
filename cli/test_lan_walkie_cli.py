@@ -741,6 +741,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     def make_beep_client(self, roger=True, keyed_gateway=True):
         c, ptt = self.make_client()
         c.beep_gate = MagicMock()
+        c.beep_src = MagicMock()
         c.roger_beep = roger
         if keyed_gateway:
             ptt.key()
@@ -762,13 +763,27 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         c, ptt = self.make_beep_client()
         await c.handle_message(floor("bbbb", "Dad"))
         await c.handle_message(floor(None))
-        c.beep_gate.set_property.assert_called_with("mute", False)
-        # tail (50 ms) + beep (150 ms): still keyed after the plain tail has passed
-        await asyncio.sleep(0.12)
+        # tail (50 ms) + the whole beep: still keyed well after the plain tail has passed
+        await asyncio.sleep(0.15)
         self.assertTrue(ptt.keyed)
-        await asyncio.sleep(0.2)
+        c.beep_gate.set_property.assert_any_call("mute", False)
+        await asyncio.sleep(cli.BEEP_MS / 1000.0 + 0.15)
         self.assertFalse(ptt.keyed)
         c.beep_gate.set_property.assert_called_with("mute", True)
+
+    async def test_beep_plays_every_note_in_order_and_ends_muted(self):
+        c, _ = self.make_beep_client()
+        await c.handle_message(floor("bbbb", "Dad"))
+        await c.handle_message(floor(None))
+        await asyncio.sleep(cli.BEEP_MS / 1000.0 + 0.1)
+        freqs = [call.args[1] for call in c.beep_src.set_property.call_args_list if call.args[0] == "freq"]
+        self.assertEqual(freqs, [float(f) for f, _ in cli.BEEP_PATTERN])
+        self.assertEqual(c.beep_gate.set_property.call_args_list[-1].args, ("mute", True))
+        self.assertEqual(cli.BEEP_MS, sum(ms for _, ms in cli.BEEP_PATTERN))
+        # The warble is continuous: the gate opens at the first note and closes once, at the end.
+        mutes = [call.args[1] for call in c.beep_gate.set_property.call_args_list if call.args[0] == "mute"]
+        self.assertEqual(mutes[-1], True)
+        self.assertEqual(mutes.count(True), 1)
 
     async def test_no_beep_when_switched_off(self):
         c, ptt = self.make_beep_client(roger=False)
@@ -804,6 +819,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_beep_branch_is_harmless(self):
         c, ptt = self.make_beep_client()
         c.beep_gate = None
+        c.beep_src = None
         await c.handle_message(floor("bbbb", "Dad"))
         await c.handle_message(floor(None))
         await asyncio.sleep(0.15)

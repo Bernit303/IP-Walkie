@@ -54,9 +54,13 @@ AIOC_USB_VID = 0x1209  # per the AIOC firmware-update docs (dfu-util -d 1209:738
 AIOC_USB_PID = 0x7388
 MAX_SIGNALING_BYTES = 256 * 1024  # SDP is a few KB; far above that is not signaling
 LEVEL_INTERVAL_NS = 20_000_000  # 20 ms level reports for VOX
-BEEP_MS = 150  # roger beep length
-BEEP_FREQ_HZ = 1000
-BEEP_VOLUME = 0.25  # audiotestsrc amplitude; kept modest because on a gateway this goes out over the radio
+# Roger beep: a MOTOTRBO-style talk-permit warble, four back-to-back notes
+# (G6 C6 G6 E6, 200 ms). Same notes as BEEP_PATTERN in public/app.js; change
+# both together. Played as a triangle wave, which carries a little third
+# harmonic like the browser's tone does.
+BEEP_PATTERN = [(1568.0, 80), (1046.5, 40), (1568.0, 40), (1318.5, 40)]  # (Hz, ms)
+BEEP_MS = sum(ms for _, ms in BEEP_PATTERN)
+BEEP_VOLUME = 0.5  # audiotestsrc amplitude; on a gateway this goes out over the radio, tune on hardware
 
 
 def safe_text(value, limit=64):
@@ -341,6 +345,7 @@ class WalkieClient:
         self.mixer = None
         self.mic_mute = None
         self.beep_gate = None  # None = no beep available (never built, or building it failed)
+        self.beep_src = None
 
     # ---------- GStreamer setup ----------
 
@@ -402,8 +407,12 @@ class WalkieClient:
             if src is None or gate is None:
                 raise RuntimeError("audiotestsrc/volume element missing")
             src.set_property("is-live", True)
-            src.set_property("freq", float(BEEP_FREQ_HZ))
+            src.set_property("freq", float(BEEP_PATTERN[0][0]))
             src.set_property("volume", BEEP_VOLUME)
+            try:
+                Gst.util_set_object_arg(src, "wave", "triangle")
+            except Exception:
+                pass  # keeps the default sine: plainer, but still a working beep
             gate.set_property("mute", True)
             self.pipeline.add(src)
             self.pipeline.add(gate)
@@ -413,20 +422,35 @@ class WalkieClient:
             if pad is None or gate.get_static_pad("src").link(pad) != Gst.PadLinkReturn.OK:
                 raise RuntimeError("could not link the tone generator to the mixer")
             self.beep_gate = gate
+            self.beep_src = src
         except Exception as e:
             self.beep_gate = None
+            self.beep_src = None
             print(f"[roger beep unavailable: {e}]", file=sys.stderr)
 
     def play_roger_beep(self):
-        """Open the beep gate for BEEP_MS. Returns how long it will sound (0 = nothing played)."""
-        if self.beep_gate is None:
+        """Play BEEP_PATTERN through the muted gate. Returns how long it takes (0 = nothing played)."""
+        if self.beep_gate is None or self.beep_src is None:
             return 0
         try:
+            offset = 0
+            for freq, ms in BEEP_PATTERN:
+                self.loop.call_later(offset / 1000.0, self._beep_note, freq)
+                offset += ms
+            self.loop.call_later(offset / 1000.0, self._end_beep)
+        except Exception:
+            self._end_beep()
+            return 0
+        return BEEP_MS
+
+    def _beep_note(self, freq):
+        if self.beep_gate is None or self.beep_src is None:
+            return
+        try:
+            self.beep_src.set_property("freq", float(freq))
             self.beep_gate.set_property("mute", False)
         except Exception:
-            return 0
-        self.loop.call_later(BEEP_MS / 1000.0, self._end_beep)
-        return BEEP_MS
+            pass
 
     def _end_beep(self):
         if self.beep_gate is None:
