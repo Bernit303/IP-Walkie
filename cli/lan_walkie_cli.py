@@ -32,6 +32,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import ssl
@@ -337,8 +338,13 @@ class WalkieClient:
         beep_lead_ms=400,
         preroll_ms=0,
         squelch="on",
+        rx_gain_db=0.0,
     ):
         self.url = url
+        self.rx_gain_db = rx_gain_db  # boost for audio arriving from the LAN, applied per peer before the mixer
+        # Loudness of each peer's audio as received, gathered while they hold the
+        # floor and summarised when they let go: peer id -> {"n", "pow", "peak"}.
+        self.rx_stats = {}
         self.name = name
         self.source = source
         self.sink = sink
@@ -439,8 +445,9 @@ class WalkieClient:
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", self.on_bus_error)
+        # Always: the per-peer RX level meters report here even without VOX.
+        bus.connect("message::element", self.on_bus_element)
         if self.vox:
-            bus.connect("message::element", self.on_bus_element)
             GLib.timeout_add_seconds(5, self._check_levels_flowing)
             if self.vox_debug:
                 GLib.timeout_add_seconds(5, self._debug_status)
@@ -602,6 +609,14 @@ class WalkieClient:
         level_db = self._level_from_structure(s)
         if level_db is None:
             return
+        # A peer's receive meter, not the radio input VOX listens to.
+        src_name = message.src.get_name() if message.src else ""
+        if src_name.startswith("rxlvl-"):
+            peak_db = self._level_from_structure(s, "peak")
+            self.record_rx_level(src_name[len("rxlvl-"):], level_db, level_db if peak_db is None else peak_db)
+            return
+        if not self.vox:
+            return
         self._level_msgs += 1
         if self.vox_debug:
             self._dbg_peak = max(self._dbg_peak, level_db)
@@ -654,23 +669,59 @@ class WalkieClient:
             )
 
     @staticmethod
-    def _level_from_structure(s):
+    def _level_from_structure(s, field="rms"):
         try:
-            rms = s.get_value("rms")
-            if rms:
-                return max(float(v) for v in rms)
+            values = s.get_value(field)
+            if values:
+                return max(float(v) for v in values)
         except Exception:
             pass
         # Some PyGObject builds don't convert GValueArray; parse the text form.
         # Seen on Ubuntu 24.04: "rms=(GValueArray)< -48.4, -48.4 >". Older
         # builds use (double) and/or { } instead, so accept any type tag.
-        m = re.search(r"rms=\([A-Za-z]+\)[<{]\s*([^>}]*)[>}]", s.to_string())
+        m = re.search(rf"{field}=\([A-Za-z]+\)[<{{]\s*([^>}}]*)[>}}]", s.to_string())
         if m:
             try:
                 return max(float(v) for v in m.group(1).split(","))
             except ValueError:
                 return None
         return None
+
+    # ---------- LAN -> radio: how loud is each talker? ----------
+
+    def record_rx_level(self, peer_id, rms_db, peak_db):
+        # Frames below -60 dBFS are the gaps between words; counting them would
+        # drag the average down and hide how loud the speech itself is.
+        if rms_db < -60:
+            return
+        st = self.rx_stats.setdefault(peer_id, {"n": 0, "pow": 0.0, "peak": -200.0})
+        st["n"] += 1
+        st["pow"] += 10 ** (rms_db / 10)
+        st["peak"] = max(st["peak"], peak_db)
+
+    def report_rx_level(self, peer_id):
+        """Print how loud a peer was over the transmission that just ended."""
+        st = self.rx_stats.pop(peer_id, None)
+        peer = self.peers.get(peer_id)
+        name = safe_text(peer.name) if peer else str(peer_id)
+        if not st or st["n"] < 5:  # under ~250 ms of speech (50 ms meter interval): a click, not a transmission
+            print(f"[rx level] {name}: no usable audio received", file=sys.stderr, flush=True)
+            return
+        avg = 10 * math.log10(st["pow"] / st["n"])
+        if avg < -35:
+            verdict = "very quiet"
+        elif avg < -28:
+            verdict = "quiet"
+        elif st["peak"] > -1:
+            verdict = "clipping"
+        else:
+            verdict = "ok"
+        gain = f", before +{self.rx_gain_db:g} dB gain" if self.rx_gain_db else ""
+        print(
+            f"[rx level] {name}: speech avg {avg:.1f} dBFS, peak {st['peak']:.1f} dBFS ({verdict}{gain})",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # ---------- radio gateway: PTT (LAN -> radio) ----------
 
@@ -912,24 +963,34 @@ class WalkieClient:
         dec = Gst.ElementFactory.make("opusdec")
         conv = Gst.ElementFactory.make("audioconvert")
         resample = Gst.ElementFactory.make("audioresample")
+        # Measures this peer's audio as received, before any --rx-gain.
+        lvl = Gst.ElementFactory.make("level", f"rxlvl-{peer.id}")
+        lvl.set_property("interval", 50_000_000)
+        lvl.set_property("post-messages", True)
+        chain = [queue, depay, dec, conv, resample, lvl]
+        if self.rx_gain_db:
+            # Per peer, before the mixer, so the roger beep (which also goes through the
+            # mixer) keeps its own volume. The volume element hard-clips above full scale.
+            gain = Gst.ElementFactory.make("volume")
+            gain.set_property("volume", 10 ** (self.rx_gain_db / 20))
+            chain.append(gain)
 
-        for el in (queue, depay, dec, conv, resample):
+        for el in chain:
             self.pipeline.add(el)
             el.sync_state_with_parent()
-        peer.recv_elements = [queue, depay, dec, conv, resample]
+        peer.recv_elements = chain
 
         pad.link(queue.get_static_pad("sink"))
-        queue.link(depay)
-        depay.link(dec)
-        dec.link(conv)
-        conv.link(resample)
+        for upstream, downstream in zip(chain, chain[1:]):
+            upstream.link(downstream)
 
         mixer_pad = self.mixer.get_request_pad("sink_%u")
-        resample.get_static_pad("src").link(mixer_pad)
+        chain[-1].get_static_pad("src").link(mixer_pad)
         peer.mixer_pad = mixer_pad
 
     def remove_peer(self, peer_id):
         peer = self.peers.pop(peer_id, None)
+        self.rx_stats.pop(peer_id, None)
         if not peer:
             return
 
@@ -1055,6 +1116,10 @@ class WalkieClient:
             previous_holder = self.floor_holder
             self.floor_holder = msg.get("holder")
             name = safe_text(msg.get("name"))
+            if previous_holder and previous_holder != self.my_id and previous_holder != self.floor_holder:
+                self.report_rx_level(previous_holder)
+            if self.floor_holder and self.floor_holder != self.my_id:
+                self.rx_stats.pop(self.floor_holder, None)  # fresh numbers per transmission
             if self.floor_holder == self.my_id:
                 self.have_floor = True
                 self.mic_mute.set_property("mute", False)
@@ -1324,6 +1389,14 @@ def main():
         "plughw:CARD=AIOC,DEV=0 (find the name with `arecord -l` / `aplay -l`).",
     )
     parser.add_argument(
+        "--rx-gain",
+        type=float,
+        default=0.0,
+        help="Boost (or cut) audio arriving from the LAN, in dB, e.g. 6. Look at the '[rx level]' "
+        "log lines first: raise it only for quiet talkers, and stop when a loud talker's peak "
+        "reaches 0 dBFS, because it hard-clips there. Limited to +20 dB.",
+    )
+    parser.add_argument(
         "--stun",
         default="stun://stun.l.google.com:19302",
         help="STUN server, or empty string to disable (pure-LAN/Tailscale setups usually don't need it; "
@@ -1411,6 +1484,8 @@ def main():
     parser.add_argument("--token", default=None, help=argparse.SUPPRESS)  # deprecated: visible in `ps`
     args = parser.parse_args()
 
+    if not -40 <= args.rx_gain <= 20:
+        parser.error("--rx-gain must be between -40 and +20 dB (GStreamer's volume element tops out at 10x)")
     if args.insecure and (args.ca_file or args.pin_sha256):
         parser.error("--insecure cannot be combined with --ca-file or --pin-sha256")
     pin = None
@@ -1474,6 +1549,7 @@ def main():
         beep_lead_ms=args.beep_lead_ms,
         preroll_ms=gate["preroll_ms"],
         squelch=squelch_mode,
+        rx_gain_db=args.rx_gain,
     )
 
     try:

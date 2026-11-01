@@ -6,7 +6,9 @@ run on any OS without audio hardware:
 """
 
 import asyncio
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import types
@@ -102,6 +104,60 @@ class LevelParsingTests(unittest.TestCase):
         s.get_value.return_value = None
         s.to_string.return_value = "level, nothing=(int)1;"
         self.assertIsNone(cli.WalkieClient._level_from_structure(s))
+
+
+class RxLevelTests(unittest.TestCase):
+    def make_client(self, **kw):
+        return cli.WalkieClient("wss://x", "R", "alsasrc", "alsasink", None, "system", **kw)
+
+    def report(self, c, peer_id):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            c.report_rx_level(peer_id)
+        return buf.getvalue()
+
+    def test_peak_field_is_parsed_from_the_text_form(self):
+        s = MagicMock()
+        s.get_value.side_effect = TypeError("GValueArray")
+        s.to_string.return_value = "level, rms=(GValueArray)< -48.4, -48.4 >, peak=(GValueArray)< -30.1, -31.0 >;"
+        self.assertEqual(cli.WalkieClient._level_from_structure(s, "peak"), -30.1)
+
+    def test_average_counts_speech_not_the_gaps_between_words(self):
+        c = self.make_client()
+        for _ in range(10):
+            c.record_rx_level("p1", -20.0, -10.0)
+        for _ in range(50):
+            c.record_rx_level("p1", -80.0, -75.0)  # silence between words
+        out = self.report(c, "p1")
+        self.assertIn("speech avg -20.0 dBFS", out)
+        self.assertIn("peak -10.0 dBFS", out)
+        self.assertIn("(ok)", out)
+
+    def test_quiet_talker_is_flagged(self):
+        c = self.make_client()
+        for _ in range(10):
+            c.record_rx_level("p1", -40.0, -30.0)
+        self.assertIn("(very quiet)", self.report(c, "p1"))
+
+    def test_clipping_is_flagged(self):
+        c = self.make_client(rx_gain_db=12)
+        for _ in range(10):
+            c.record_rx_level("p1", -15.0, -0.2)
+        out = self.report(c, "p1")
+        self.assertIn("(clipping, before +12 dB gain)", out)
+
+    def test_too_little_audio_is_reported_as_none(self):
+        c = self.make_client()
+        c.record_rx_level("p1", -20.0, -10.0)
+        self.assertIn("no usable audio received", self.report(c, "p1"))
+        self.assertIn("no usable audio received", self.report(c, "never-spoke"))
+
+    def test_report_clears_the_stats(self):
+        c = self.make_client()
+        for _ in range(10):
+            c.record_rx_level("p1", -20.0, -10.0)
+        self.report(c, "p1")
+        self.assertNotIn("p1", c.rx_stats)
 
 
 class PipelineTests(unittest.TestCase):

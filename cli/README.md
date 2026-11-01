@@ -155,6 +155,26 @@ clipped, lower `--vox-attack-ms`; if words are chopped mid-sentence, raise
 `--vox-hang-ms`. Expect some clipping of the first syllable: the floor
 request needs a round trip before the microphone is unmuted.
 
+### Quiet talkers: `[rx level]` and `--rx-gain`
+
+Every time someone on the LAN lets go of the floor, the gateway logs how loud
+they were when their audio arrived, before any gain:
+
+    [rx level] Maria: speech avg -38.2 dBFS, peak -21.0 dBFS (very quiet)
+
+The average counts speech only (frames below -60 dBFS are ignored). About -20
+to -25 dBFS is healthy; below -28 is flagged `quiet`, below -35 `very quiet`,
+and a peak above -1 dBFS `clipping`. `no usable audio received` means the
+gateway got less than about 250 ms of speech from that talker.
+
+A phone that sends a quiet signal (iOS Safari's microphone and its automatic
+level control often do) comes out of the radio quiet, because nothing between
+the browser and the AIOC changes the level. `--rx-gain <dB>` adds gain to every
+talker coming from the LAN, for example `--rx-gain 6`. It is applied per talker
+before the mixer, so the roger beep keeps its own volume. It clips hard at full
+scale, so stop raising it when a loud talker's peak reaches 0 dBFS. Range
+-40 to +20. For the systemd service put it in `WALKIE_EXTRA_ARGS`.
+
 ## Priority token
 
 ```bash
@@ -226,4 +246,5 @@ What the unit does:
 | `--aioc`, `--ptt-serial`, `--ptt-tail-ms`, `--max-ptt-seconds` | Radio keying |
 | `--squelch on|off`, `--preroll-ms` | Software squelch preset and pre-roll (also `LAN_WALKIE_SQUELCH`) |
 | `--no-vox`, `--vox-threshold-db`, `--vox-attack-ms`, `--vox-hang-ms` | Radio receive detection |
+| `--rx-gain` | Gain in dB for audio from the LAN (default 0), see "Quiet talkers" |
 | `--token-file` | Priority token |
