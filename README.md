@@ -91,6 +91,7 @@ Server environment variables (all optional):
 | `MAX_CLIENTS` | `32` | Maximum simultaneous connections |
 | `PRIORITY_TOKEN` | unset | Shared secret (16+ chars) that grants priority/preemption; unset disables priority |
 | `ALLOWED_ORIGINS` | unset | Comma-separated browser origins allowed to open the WebSocket |
+| `FRAME_ANCESTORS` | unset | Space- or comma-separated origins allowed to embed the page in an iframe (e.g. a Home Assistant dashboard). Unset = framing denied |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`; see [docs/LOGGING.md](docs/LOGGING.md) |
 | `LOG_FORMAT` | `text` | `text`, or `json` for one JSON object per line |
 | `LOG_STATS_MS` | `300000` | Interval of the one-line `stats` summary; `0` turns it off |

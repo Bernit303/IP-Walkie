@@ -33,6 +33,9 @@ services:
       - PRIORITY_TOKEN=${PRIORITY_TOKEN:-}
       # Comma-separated browser origins allowed to open the WebSocket.
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+      # Space- or comma-separated origins allowed to embed the page in an iframe
+      # (e.g. a Home Assistant dashboard). Empty = framing denied.
+      - FRAME_ANCESTORS=${FRAME_ANCESTORS:-}
     # Docker keeps container logs forever by default; cap them (5 files of 10 MB)
     # so a chatty day can never fill the disk.
     logging:

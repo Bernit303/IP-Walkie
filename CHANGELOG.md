@@ -3,6 +3,9 @@
 ## Unreleased
 
 ### Added
+- Optional `FRAME_ANCESTORS` (space- or comma-separated origins) lets the page be embedded in an
+  iframe, e.g. a Home Assistant dashboard. Unset keeps framing denied. Invalid entries are
+  ignored with a warning; `*` is never accepted.
 - Software squelch switch for the radio gateway: `--squelch on|off` (or `LAN_WALKIE_SQUELCH`
   in the service's env file). `on` is the gate exactly as before; `off` uses a much lower
   threshold (-55 dBFS, kept above the measured -64 dBFS idle floor), no attack delay and a

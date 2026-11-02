@@ -68,6 +68,18 @@ const PLACEHOLDER_TOKENS = new Set(['some-long-random-string', 'changeme', 'chan
 // always allowed.
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
 
+// Pages allowed to show the walkie inside an <iframe> (for example a Home
+// Assistant dashboard). Space- or comma-separated origins, e.g.
+// "https://ha.example.ts.net:8444". Unset keeps the old behavior: no framing.
+// Each entry must be a bare http(s) origin (no path, quotes or ';'), so a typo
+// or hostile value can never inject another CSP directive; "*" is never valid.
+const FRAME_ORIGIN_RE = /^https?:\/\/(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$/;
+const FRAME_ANCESTORS = [];
+for (const o of (process.env.FRAME_ANCESTORS || '').split(/[\s,]+/).filter(Boolean)) {
+  if (FRAME_ORIGIN_RE.test(o)) FRAME_ANCESTORS.push(o);
+  else log.warn('frame-ancestors-ignored', { reason: 'not a plain http(s) origin' });
+}
+
 // Whoever joins with this token is marked priority and can preempt a
 // non-priority speaker. Leave unset to disable priority entirely.
 let PRIORITY_TOKEN = process.env.PRIORITY_TOKEN || null;
@@ -152,11 +164,14 @@ app.use((req, res, next) => {
   res.set({
     'Content-Security-Policy':
       "default-src 'self'; connect-src 'self' wss:; media-src 'self' blob: mediastream:; " +
-      "img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+      "img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors " +
+      (FRAME_ANCESTORS.length ? FRAME_ANCESTORS.join(' ') : "'none'"),
     'X-Content-Type-Options': 'nosniff',
-    'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
   });
+  // X-Frame-Options cannot express an allow-list; with FRAME_ANCESTORS set the
+  // CSP directive above is the only framing rule.
+  if (!FRAME_ANCESTORS.length) res.set('X-Frame-Options', 'DENY');
   next();
 });
 app.use(express.static(path.join(__dirname, 'public')));
@@ -450,6 +465,7 @@ server.listen(PORT, '0.0.0.0', () => {
     priority: PRIORITY_TOKEN ? 'enabled' : 'disabled',
     roger_beep: ROGER_BEEP ? 'on' : 'off',
     allowed_origins: ALLOWED_ORIGINS.length,
+    frame_ancestors: FRAME_ANCESTORS.length,
     log_level: log.level,
     log_format: log.format,
     stats_ms: LOG_STATS_MS,

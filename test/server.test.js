@@ -536,3 +536,52 @@ test('over the whole run, the token never appeared in the server log', () => {
   assert.ok(!serverLog.includes(TOKEN));
   assert.equal(server.exited, false);
 });
+
+// Fetches the page over HTTPS from a throwaway server and returns the response headers.
+function headersOf(p) {
+  return new Promise((resolve, reject) => {
+    require('node:https').get({ host: '127.0.0.1', port: p, path: '/', rejectUnauthorized: false }, (res) => {
+      res.resume();
+      resolve(res.headers);
+    }).on('error', reject);
+  });
+}
+
+test('framing is denied by default', async () => {
+  const s = await startServer({ FRAME_ANCESTORS: '' });
+  try {
+    const h = await headersOf(s.port);
+    assert.match(h['content-security-policy'], /frame-ancestors 'none'/);
+    assert.equal(h['x-frame-options'], 'DENY');
+  } finally {
+    s.child.kill();
+  }
+});
+
+test('FRAME_ANCESTORS allows the listed origins and drops X-Frame-Options', async () => {
+  const s = await startServer({ FRAME_ANCESTORS: 'https://ha.example.ts.net:8444, http://10.0.0.5:8123' });
+  try {
+    const h = await headersOf(s.port);
+    assert.match(h['content-security-policy'], /frame-ancestors https:\/\/ha\.example\.ts\.net:8444 http:\/\/10\.0\.0\.5:8123$/);
+    assert.equal(h['x-frame-options'], undefined);
+    assert.match(h['content-security-policy'], /default-src 'self'.*object-src 'none'/);
+  } finally {
+    s.child.kill();
+  }
+});
+
+test('a hostile FRAME_ANCESTORS value is ignored and framing stays denied', async () => {
+  for (const bad of ['https://a.com; script-src *', '*', 'https://a.com"', "https://a.com/path", 'javascript:alert(1)']) {
+    const s = await startServer({ FRAME_ANCESTORS: bad });
+    try {
+      const h = await headersOf(s.port);
+      assert.match(h['content-security-policy'], /frame-ancestors 'none'$/, bad);
+      assert.ok(!h['content-security-policy'].includes('script-src'), bad);
+      assert.equal(h['x-frame-options'], 'DENY', bad);
+      await sleep(100);
+      assert.match(s.out, / WARN {2}frame-ancestors-ignored /, bad);
+    } finally {
+      s.child.kill();
+    }
+  }
+});
