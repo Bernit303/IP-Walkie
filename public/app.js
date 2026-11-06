@@ -488,3 +488,5 @@ document.addEventListener('visibilitychange', () => {
 
 window.addEventListener('keydown', (e) => { if (e.code === 'Space' && !e.repeat) startTalk(); });
 window.addEventListener('keyup', (e) => { if (e.code === 'Space') stopTalk(); });
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
