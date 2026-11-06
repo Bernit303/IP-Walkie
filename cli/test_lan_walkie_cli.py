@@ -14,7 +14,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 class FakeSerial:
@@ -998,6 +998,80 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.6)
         for call in c.beep_gate.set_property.call_args_list:
             self.assertNotEqual(call.args, ("mute", False))
+
+    # ---------- second audit (R02, R04, R10, R14) ----------
+
+    async def test_failed_watchdog_unkey_is_retried_and_does_not_leave_a_stale_timer(self):
+        c, ptt = self.make_client()
+        await c.handle_message(floor("bbbb", "Dad"))
+        real_unkey = ptt.unkey
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("serial write failed")
+            real_unkey()
+
+        ptt.unkey = flaky
+        c._watchdog_unkey()
+        self.assertTrue(ptt.keyed)
+        self.assertIsNotNone(c._ptt_watchdog)  # a retry is pending, not an expired handle
+        await asyncio.sleep(1.2)
+        self.assertFalse(ptt.keyed)
+        self.assertIsNone(c._ptt_watchdog)
+
+    async def test_talk_request_without_a_session_is_not_remembered(self):
+        c, _ = self.make_client()
+        c.my_id = None
+        await c.start_talk()
+        self.assertFalse(c.talking)
+        self.assertEqual(c.sent, [])
+
+    async def test_vox_is_blocked_until_the_welcome_has_arrived(self):
+        c, _ = self.make_client()
+        c.ws = object()
+        c.my_id = None
+        c.vox_debug = False
+        c._fire = MagicMock()
+        s = types.SimpleNamespace(get_name=lambda: "level")
+        c._level_from_structure = lambda *_a, **_k: 0.0  # loud
+        msg = types.SimpleNamespace(get_structure=lambda: s, src=types.SimpleNamespace(get_name=lambda: "lvl"))
+        for _ in range(20):  # well past the attack time
+            c.on_bus_element(None, msg)
+        self.assertFalse(c.vox.active)
+
+    def _bus_error(self, element_name):
+        err = MagicMock()
+        msg = MagicMock()
+        msg.parse_error.return_value = (err, "debug")
+        msg.src.get_name.return_value = element_name
+        return msg
+
+    async def test_sound_device_error_unkeys_and_exits(self):
+        c, ptt = self.make_client()
+        ptt.key()
+        with patch.object(cli.os, "_exit") as exit_:
+            c.on_bus_error(None, self._bus_error("alsasrc0"))
+        exit_.assert_called_once_with(1)
+        self.assertFalse(ptt.keyed)
+
+    async def test_a_peer_branch_error_does_not_restart_the_gateway(self):
+        c, _ = self.make_client()
+        with patch.object(cli.os, "_exit") as exit_:
+            c.on_bus_error(None, self._bus_error("webrtcbin3"))
+            c.on_bus_error(None, self._bus_error("opusdec1"))
+        exit_.assert_not_called()
+
+    def test_sdp_debug_lines_cannot_carry_terminal_escapes(self):
+        c = cli.WalkieClient("wss://x", "R", "src", "sink", None, "system", vox_debug=True)
+        buf = io.StringIO()
+        evil = "a=mid:" + chr(27) + "]0;pwned" + chr(7) + "audio" + chr(10) + "m=audio 9 RTP/AVP 111"
+        with patch.object(cli.sys, "stderr", buf):
+            c._log_sdp("remote", evil)
+        self.assertNotIn(chr(27), buf.getvalue())
+        self.assertNotIn(chr(7), buf.getvalue())
+
 
     def test_failed_beep_branch_leaves_the_rest_of_the_pipeline_alone(self):
         made = cli.Gst.ElementFactory.make.return_value

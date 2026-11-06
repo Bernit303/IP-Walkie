@@ -632,3 +632,37 @@ test('a client that joins an idle channel gets no floor message', async () => {
   const c = await client('Quiet', null);
   assert.equal(last(c, 'floor'), undefined);
 });
+
+test('a client that stops reading is dropped instead of buffering without limit', async () => {
+  const s = await startServer({ MAX_CLIENTS: '4' });
+  const socks = [];
+  try {
+    const mk = async (name) => {
+      const ws = new WebSocket(`wss://127.0.0.1:${s.port}`, { rejectUnauthorized: false });
+      socks.push(ws);
+      ws.msgs = [];
+      ws.on('message', (d) => ws.msgs.push(JSON.parse(d)));
+      await new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject); });
+      const welcome = await waitFor(() => last(ws, 'welcome'));
+      ws.id = welcome.id;
+      ws.send(JSON.stringify({ type: 'join', name }));
+      await sleep(100);
+      return ws;
+    };
+    const stuck = await mk('Stuck');
+    const sender = await mk('Sender');
+    stuck._socket.pause(); // stops reading: the kernel buffers fill, then the server's queue grows
+    const payload = { type: 'offer', target: stuck.id, sdp: 'A'.repeat(30000) };
+    for (let i = 0; i < 1500 && sender.readyState === WebSocket.OPEN; i++) {
+      sender.send(JSON.stringify(payload));
+      if (i % 100 === 99) await sleep(220); // stay under the per-second message limit
+    }
+    await sleep(300);
+    assert.equal(s.child.exitCode, null, 'server exited');
+    assert.ok(s.out.includes(' slow-consumer '), 'the stuck client was not cut off');
+    assert.equal(sender.readyState, WebSocket.OPEN, 'the sender must not be affected');
+  } finally {
+    for (const w of socks) w.terminate();
+    s.child.kill();
+  }
+});

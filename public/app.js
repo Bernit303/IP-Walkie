@@ -65,6 +65,7 @@ for (const evt of ['pointerdown', 'touchend', 'keydown', 'click']) {
 }
 
 function playRogerBeep() {
+  if (document.hidden) return;
   try {
     if (!beepCtx || beepCtx.state !== 'running') return; // not unlocked yet: stay silent
     // One oscillator for the whole warble, so the phase stays continuous when
@@ -123,17 +124,59 @@ changeNameLink.addEventListener('click', (e) => {
   location.reload();
 });
 
+let joining = false;
+let rosterIds = new Set(); // peers the server currently lists
+
+// The browser can end the microphone track by itself (device unplugged,
+// permission revoked, another app took it). An ended track cannot be turned
+// back on, so get a new one and hand it to every open connection.
+function watchMic(track) {
+  track.addEventListener('ended', () => { if (track === audioTrack) reacquireMic(); });
+}
+
+let reacquiring = false;
+async function reacquireMic() {
+  if (reacquiring) return;
+  reacquiring = true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+    const track = stream.getAudioTracks()[0];
+    track.enabled = false;
+    const old = localStream;
+    localStream = stream;
+    audioTrack = track;
+    watchMic(track);
+    for (const pc of peers.values()) {
+      for (const sender of pc.getSenders()) {
+        if (sender.track === null || sender.track.kind === 'audio') sender.replaceTrack(track).catch(() => {});
+      }
+    }
+    if (old) old.getTracks().forEach((t) => t.stop());
+    wantTalk = false;
+    pttBtn.classList.remove('active');
+  } catch {
+    pttBtn.disabled = true;
+    statusEl.textContent = 'Microphone lost. Allow the mic and reload.';
+  } finally {
+    reacquiring = false;
+  }
+}
+
 async function join(name) {
+  if (joining) return; // a second tap while the mic prompt is open must not start a second session
+  joining = true;
   myName = name || 'Anon';
   try {
     localStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
   } catch (e) {
+    joining = false;
     alert('Microphone access denied. Allow the mic in your browser settings and reload.');
     return;
   }
   localStorage.setItem(NAME_KEY, myName);
   audioTrack = localStream.getAudioTracks()[0];
   audioTrack.enabled = false; // muted until PTT is held
+  watchMic(audioTrack);
   setupEl.classList.add('hidden');
   talkEl.classList.remove('hidden');
   myNameLabel.textContent = myName;
@@ -195,6 +238,7 @@ function connect() {
 
     if (msg.type === 'peers') {
       const incomingIds = new Set(msg.peers.map((p) => p.id));
+      rosterIds = incomingIds;
       for (const p of msg.peers) {
         if (!peers.has(p.id)) createPeer(p.id, myId < p.id);
       }
@@ -376,6 +420,7 @@ function createPeer(id, initiator) {
       audioEls.set(id, audioEl);
     }
     audioEl.srcObject = event.streams[0];
+    audioEl.muted = document.hidden; // nothing plays while the app is in the background
 
     // Chrome-only, silently ignored elsewhere: shrinks the jitter buffer's
     // target delay. Worth trading a little resilience to network jitter for
@@ -407,8 +452,16 @@ function createPeer(id, initiator) {
     if (myId < id) {
       createPeer(id, true); // negotiationneeded fires a fresh offer automatically
     }
-    // Non-initiator side just waits for that new offer, same as first
-    // contact — see the 'offer' handler in connect().
+    // Non-initiator side waits for that new offer, same as first contact —
+    // see the 'offer' handler in connect(). The gateway never initiates a
+    // new offer, so if none arrives, rebuild the whole session instead of
+    // staying silent for good.
+    else {
+      const sock = ws;
+      setTimeout(() => {
+        if (ws === sock && sock && rosterIds.has(id) && !peers.has(id)) dropSocketAndReconnect();
+      }, 8000);
+    }
   }
   pc.addEventListener('iceconnectionstatechange', () => {
     clearTimeout(disconnectTimer);
@@ -455,6 +508,7 @@ function renderPeerList(list) {
 
 function startTalk() {
   if (!audioTrack || floorHolder || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (audioTrack.readyState === 'ended') { reacquireMic(); return; } // never claim the floor with a dead mic
   wantTalk = true;
   wsSend({ type: 'ptt-start' });
 }
@@ -488,6 +542,9 @@ window.addEventListener('blur', stopTalk);
 window.addEventListener('pagehide', stopTalk);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) stopTalk();
+  // Foreground only: received audio is muted (not torn down, so no tap is
+  // needed to resume) while hidden.
+  for (const el of audioEls.values()) el.muted = document.hidden;
 });
 
 window.addEventListener('keydown', (e) => { if (e.code === 'Space' && !e.repeat) startTalk(); });

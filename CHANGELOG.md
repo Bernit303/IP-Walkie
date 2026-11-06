@@ -26,6 +26,21 @@
   speaker starts, are cancelled instead of reopening the beep gate later.
 - Browser: releasing Talk closes the microphone immediately instead of waiting for the server.
 
+- Gateway: if the PTT watchdog's unkey write fails, it is retried every second instead of
+  leaving a spent timer that stopped any new watchdog from being armed.
+- Gateway: an error from the sound device itself (ALSA/Pulse/PipeWire) now unkeys and restarts
+  the gateway; before, it was only printed and the gateway stayed connected but deaf or mute.
+  Errors from a phone's branch are not fatal.
+- Gateway: radio audio is not turned into a talk request before the server's welcome has
+  arrived, so a request made before joining can no longer be lost and leave a false "talking".
+- Gateway debug SDP logging strips control characters and is length-bounded.
+- Server: a client that stops reading is disconnected once 512 KB is queued for it
+  (`slow-consumer` log line) instead of growing server memory without limit.
+- Browser: Join cannot run twice at once; an ended microphone track is replaced (also before
+  a transmission starts) instead of being reused; a higher-ID phone that is left waiting for
+  a new offer after a media failure rebuilds its session after 8 s; received audio and the
+  roger beep are muted while the page is in the background.
+
 ### Added
 - Optional `FRAME_ANCESTORS` (space- or comma-separated origins) lets the page be embedded in an
   iframe, e.g. a Home Assistant dashboard. Unset keeps framing denied. Invalid entries are

@@ -587,7 +587,8 @@ class WalkieClient:
             return
         keep = ("m=", "a=sendrecv", "a=recvonly", "a=sendonly", "a=inactive", "a=rtpmap", "a=mid")
         lines = [ln.strip() for ln in sdp_text.splitlines() if ln.startswith(keep)]
-        print(f"[sdp] {label}: " + " | ".join(lines), file=sys.stderr)
+        # Peer-controlled text: strip terminal control characters, bound the size.
+        print(f"[sdp] {label}: " + safe_text(" | ".join(lines), limit=1000), file=sys.stderr)
 
     @staticmethod
     def _rss_mb():
@@ -689,9 +690,29 @@ class WalkieClient:
     def _note_peer_op(self, what, peer_id):
         self._last_peer_op = (what, peer_id, time.monotonic())
 
+    DEVICE_ELEMENT_PREFIXES = ("alsa", "autoaudio", "pulse", "pipewire")
+
     def on_bus_error(self, bus, message):
         err, debug = message.parse_error()
         print(f"[gst error] {err} ({debug})", file=sys.stderr)
+        # An error from the sound device itself (USB card unplugged, driver
+        # fault) leaves a gateway that is connected but deaf or mute, and no
+        # other watchdog can tell. Unkey and let systemd restart us. Errors
+        # from a peer's branch are not fatal: one bad phone must not be able
+        # to restart the gateway.
+        src = getattr(message, "src", None)
+        name = src.get_name() if src is not None else ""
+        if isinstance(name, str) and name.startswith(self.DEVICE_ELEMENT_PREFIXES):
+            self._fatal_exit(f"sound device error from {name}: {err}")
+
+    def _fatal_exit(self, reason):
+        print(f"[fatal] {reason}; unkeying and restarting the gateway.", file=sys.stderr, flush=True)
+        try:
+            if self.ptt:
+                self.ptt.unkey()
+        except Exception:
+            pass
+        os._exit(1)
 
     # ---------- radio gateway: VOX (radio -> LAN) ----------
 
@@ -728,7 +749,8 @@ class WalkieClient:
         blocked = (self.ptt is not None and self.ptt.keyed) or time.monotonic() < self._vox_blocked_until
         # Don't ask for the floor while someone else holds it or we have no
         # session; the radio audio has nowhere to go.
-        if self.ws is None or (self.floor_holder not in (None, self.my_id)):
+        # (my_id is set when the server's welcome arrives, right before our join.)
+        if self.ws is None or self.my_id is None or (self.floor_holder not in (None, self.my_id)):
             blocked = True
         event = self.vox.update(level_db, LEVEL_INTERVAL_NS / 1e6, blocked=blocked)
         if self.squelch == "off":
@@ -838,7 +860,15 @@ class WalkieClient:
 
     def _watchdog_unkey(self):
         print("\n[radio: max PTT time reached — unkeying]", file=sys.stderr)
-        self.radio_unkey(immediate=True)
+        # This timer has fired, so its handle is spent. If the unkey fails
+        # (serial error), a stale handle would stop radio_key() from ever
+        # arming another watchdog: keep trying until the write succeeds.
+        self._ptt_watchdog = None
+        try:
+            self.radio_unkey(immediate=True)
+        except Exception as e:
+            print(f"[radio: UNKEY FAILED ({e}); retrying in 1 s]", file=sys.stderr, flush=True)
+            self._ptt_watchdog = self.loop.call_later(1.0, self._watchdog_unkey)
 
     def radio_unkey(self, immediate=False, extra_ms=0):
         """extra_ms: hold the key that much longer, so a roger beep finishes on air."""
@@ -1291,6 +1321,8 @@ class WalkieClient:
     async def start_talk(self):
         if self.talking:
             return
+        if self.my_id is None:
+            return  # no session yet: the server would ignore it and we would keep a false intent
         self.talking = True
         await self.send({"type": "ptt-start"})
 

@@ -214,8 +214,19 @@ let floorHolder = null; // id of whoever currently has permission to transmit
 let floorTimer = null;
 let floorSince = 0;
 
+// A client that stops reading must not make the server buffer for it without
+// limit (inbound is capped per message and per second, outbound was not).
+const MAX_OUTBOUND_BYTES = 512 * 1024;
+
 function send(ws, msg) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const data = JSON.stringify(msg);
+  if (ws.bufferedAmount + Buffer.byteLength(data) > MAX_OUTBOUND_BYTES) {
+    log.warn('slow-consumer', { buffered: ws.bufferedAmount, limit: MAX_OUTBOUND_BYTES });
+    ws.terminate();
+    return;
+  }
+  ws.send(data, (err) => { if (err) ws.terminate(); });
 }
 
 function broadcastFloor() {
