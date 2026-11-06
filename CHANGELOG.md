@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+- Radio gateway going deaf: twice in one day (2026-11-05 evening and 2026-11-06) the gateway
+  stayed connected but stopped receiving from the radio (`0 level readings`, `-inf dBFS` in the
+  status line) while transmitting to the radio kept working, so replies from the radio never
+  reached the phones. Both times it began within seconds of a phone connecting. The level meter
+  now sits behind a queue that drops audio instead of blocking, so what happens to a peer's
+  branch can no longer stop it, and a watchdog restarts the gateway (systemd brings it back
+  in about 5 s) if the radio input or the send path produces nothing for 30 s. The restart
+  report names the last peer add/remove and dumps the Python thread stacks.
+
 ### Added
 - Optional `FRAME_ANCESTORS` (space- or comma-separated origins) lets the page be embedded in an
   iframe, e.g. a Home Assistant dashboard. Unset keeps framing denied. Invalid entries are

@@ -30,6 +30,7 @@ Run:
 
 import argparse
 import asyncio
+import faulthandler
 import hashlib
 import json
 import math
@@ -78,6 +79,17 @@ SQUELCH_PRESETS = {
     "off": {"threshold_db": -55.0, "attack_ms": 20, "hang_ms": 1500, "preroll_ms": 300},
 }
 STUCK_OPEN_SECONDS = 30  # squelch off: warn if the radio input never goes quiet this long
+# Input watchdog: the level meter normally reports every 20 ms, even on a silent
+# channel. If it reports nothing for this long, the capture thread is stuck (seen on
+# 2026-11-05 and 2026-11-06: the gateway stayed connected but deaf for hours while
+# transmitting still worked). The process exits and systemd (Restart=always) starts it clean.
+LEVEL_STALL_SECONDS = 30
+# The radio input and the level meter run on the capture thread. Everything after the
+# encoder (the tee and every peer's branch, which are added and removed while it runs)
+# is moved onto its own thread behind a queue that drops the oldest audio instead of
+# blocking, so nothing that happens to a peer can stop the level meter (and with it
+# radio -> LAN) again.
+CAPTURE_DECOUPLE_NS = 500_000_000
 
 
 def squelch_settings(mode, threshold_db=None, attack_ms=None, hang_ms=None, preroll_ms=None):
@@ -372,6 +384,12 @@ class WalkieClient:
         self._vox_blocked_until = 0.0
         self.vox_debug = vox_debug
         self._level_msgs = 0
+        self._tee_buffers = 0  # audio buffers that reached the tee (counted by a pad probe)
+        self._wd_last_levels = 0
+        self._wd_last_sent = 0
+        self._wd_sent_seen = False  # the send path has been seen working at least once
+        self._wd_quiet_ticks = 0
+        self._last_peer_op = None  # (what, peer id, time) of the latest peer add/remove, for the watchdog report
         self._dbg_status_last = 0
         self._dbg_peak = float("-inf")
         self._dbg_window_peak = float("-inf")
@@ -401,7 +419,11 @@ class WalkieClient:
         if self.vox:
             # Before the mute: the radio's audio is measured even while it is
             # not being sent to the LAN, which is exactly when VOX needs it.
-            level = f"level name=lvl interval={LEVEL_INTERVAL_NS} post-messages=true ! "
+            level = (
+                f"level name=lvl interval={LEVEL_INTERVAL_NS} post-messages=true ! "
+                f"queue name=capq leaky=downstream max-size-buffers=0 max-size-bytes=0 "
+                f"max-size-time={CAPTURE_DECOUPLE_NS} ! "
+            )
             if with_preroll and self.preroll_ms > 0:
                 # After the level meter, so VOX still sees the audio live while the audio
                 # that is sent is this much behind. Only the radio -> LAN path pays the delay.
@@ -438,6 +460,8 @@ class WalkieClient:
             self.pipeline = Gst.parse_launch(f"{self._capture_chain(False)}  {playback}  {keepalive}")
         self.tee = self.pipeline.get_by_name("t")
         self.tee.set_property("allow-not-linked", True)  # fine to have zero peers connected
+        # Count what reaches the tee so the watchdog can tell a stuck send path from a stuck input.
+        self.tee.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._count_tee_buffer)
         self.mixer = self.pipeline.get_by_name("mix")
         self.mic_mute = self.pipeline.get_by_name("mic-mute")
         self._build_beep_branch()
@@ -449,6 +473,7 @@ class WalkieClient:
         bus.connect("message::element", self.on_bus_element)
         if self.vox:
             GLib.timeout_add_seconds(5, self._check_levels_flowing)
+            GLib.timeout_add_seconds(5, self._levels_watchdog)
             if self.vox_debug:
                 GLib.timeout_add_seconds(5, self._debug_status)
 
@@ -595,6 +620,55 @@ class WalkieClient:
                 file=sys.stderr,
             )
         return False  # one-shot
+
+    def _levels_watchdog(self):
+        """Runs on the GLib thread every 5 s. If the radio input has produced no level
+        readings for LEVEL_STALL_SECONDS, restart the whole process.
+
+        os._exit, not sys.exit: the stuck part is native GStreamer code, and a normal
+        shutdown would wait for it. The radio is unkeyed first so it can never be left
+        transmitting. systemd brings the service back after RestartSec."""
+        levels, sent = self._level_msgs, self._tee_buffers
+        levels_moved = levels != self._wd_last_levels
+        sent_moved = sent != self._wd_last_sent
+        self._wd_last_levels, self._wd_last_sent = levels, sent
+        # The send path only counts once it has been seen working, so a probe that
+        # never fires can never cause a restart loop.
+        send_stuck = self._wd_sent_seen and not sent_moved
+        if sent_moved:
+            self._wd_sent_seen = True
+        if levels_moved and not send_stuck:
+            self._wd_quiet_ticks = 0
+            return True  # repeat
+        self._wd_quiet_ticks += 1
+        if self._wd_quiet_ticks * 5 >= LEVEL_STALL_SECONDS:
+            what = "radio-input level readings" if not levels_moved else "audio reaching the send path"
+            op = self._last_peer_op
+            last = f"{op[0]} {op[1]} {time.monotonic() - op[2]:.0f} s ago" if op else "none"
+            print(
+                f"[watchdog] no {what} for {LEVEL_STALL_SECONDS} s ({len(self.peers)} peer(s); "
+                f"last peer operation: {last}); restarting the gateway. Python thread stacks follow:",
+                file=sys.stderr, flush=True,
+            )
+            try:
+                # Shows which call (if any) the main thread is stuck in.
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            except Exception:
+                pass
+            try:
+                if self.ptt is not None:
+                    self.ptt.unkey()
+            except Exception:
+                pass
+            os._exit(1)
+        return True  # repeat
+
+    def _count_tee_buffer(self, pad, info):
+        self._tee_buffers += 1
+        return Gst.PadProbeReturn.OK
+
+    def _note_peer_op(self, what, peer_id):
+        self._last_peer_op = (what, peer_id, time.monotonic())
 
     def on_bus_error(self, bus, message):
         err, debug = message.parse_error()
@@ -780,6 +854,7 @@ class WalkieClient:
 
     def create_peer_connection(self, peer, initiator):
         peer_id = peer.id
+        self._note_peer_op("add-start", peer_id)
         webrtcbin = Gst.ElementFactory.make("webrtcbin", f"peer-{peer_id}")
         webrtcbin.set_property("bundle-policy", "max-bundle")
         configure_upnp(webrtcbin, self.upnp)
@@ -846,6 +921,7 @@ class WalkieClient:
         if initiator:
             self.on_negotiation_needed(webrtcbin, peer_id)
 
+        self._note_peer_op("add-done", peer_id)
         return webrtcbin
 
     def on_negotiation_needed(self, webrtcbin, peer_id):
@@ -993,6 +1069,7 @@ class WalkieClient:
         self.rx_stats.pop(peer_id, None)
         if not peer:
             return
+        self._note_peer_op("remove-start", peer_id)
 
         if peer.webrtcbin:
             # The pad-added closure owns peer, which owns webrtcbin. Explicitly
@@ -1033,6 +1110,7 @@ class WalkieClient:
         peer.pending_ice.clear()
         peer.mixer_pad = None
         peer.recv_elements.clear()
+        self._note_peer_op("remove-done", peer_id)
 
     def reset_for_reconnect(self):
         """

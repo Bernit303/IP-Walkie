@@ -994,9 +994,81 @@ class SquelchTests(unittest.TestCase):
         launch = self.launch_string(self.make(vox=cli.Vox(), preroll_ms=0, squelch="on"))
         self.assertNotIn("preroll", launch)
         self.assertIn(
-            "level name=lvl interval=20000000 post-messages=true ! volume name=mic-mute mute=true ! opusenc bitrate=32000 ! tee name=t",
+            "level name=lvl interval=20000000 post-messages=true ! "
+            "queue name=capq leaky=downstream max-size-buffers=0 max-size-bytes=0 max-size-time=500000000 ! "
+            "volume name=mic-mute mute=true ! opusenc bitrate=32000 ! tee name=t",
             launch,
         )
+
+    def test_the_level_meter_is_decoupled_from_everything_after_it(self):
+        # The queue drops the oldest audio instead of blocking, so a stuck peer
+        # branch can never stop the capture thread that feeds the level meter.
+        for kw in (dict(preroll_ms=0, squelch="on"), dict(preroll_ms=300, squelch="off")):
+            launch = self.launch_string(self.make(vox=cli.Vox(), **kw))
+            self.assertLess(launch.index("level name=lvl"), launch.index("queue name=capq leaky=downstream"))
+            self.assertLess(launch.index("queue name=capq"), launch.index("volume name=mic-mute"))
+
+    # ---- the input watchdog
+
+    def _run_watchdog(self, c, ticks):
+        """Call the watchdog `ticks` times; return whether it asked the process to exit."""
+        from unittest.mock import patch
+        with patch.object(cli.os, "_exit") as exit_mock, contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(ticks):
+                c._levels_watchdog()
+            return exit_mock.called, exit_mock
+
+    def test_watchdog_restarts_after_30_s_without_level_readings(self):
+        c = self.make(vox=cli.Vox())
+        c.ptt = MagicMock()
+        c._level_msgs = 10
+        c._levels_watchdog()  # readings moved: counting starts from here
+        called, _ = self._run_watchdog(c, 5)  # 25 s of silence
+        self.assertFalse(called)
+        called, exit_mock = self._run_watchdog(c, 1)  # 30 s
+        self.assertTrue(called)
+        exit_mock.assert_called_with(1)
+        c.ptt.unkey.assert_called()  # never leave the radio transmitting
+
+    def test_watchdog_stays_quiet_while_readings_keep_coming(self):
+        c = self.make(vox=cli.Vox())
+        from unittest.mock import patch
+        with patch.object(cli.os, "_exit") as exit_mock:
+            for i in range(1, 50):
+                c._level_msgs = i * 250
+                self.assertTrue(c._levels_watchdog())
+        exit_mock.assert_not_called()
+
+    def test_watchdog_restarts_when_the_send_path_dies_but_the_input_lives(self):
+        c = self.make(vox=cli.Vox())
+        from unittest.mock import patch
+        with patch.object(cli.os, "_exit") as exit_mock, contextlib.redirect_stderr(io.StringIO()):
+            c._level_msgs, c._tee_buffers = 250, 250
+            c._levels_watchdog()  # both moving: the send path is now known to work
+            for i in range(2, 12):
+                c._level_msgs = i * 250  # the input keeps going...
+                c._levels_watchdog()  # ...but nothing reaches the tee any more
+        exit_mock.assert_called_with(1)
+
+    def test_watchdog_never_restarts_over_a_probe_that_was_never_seen_firing(self):
+        c = self.make(vox=cli.Vox())
+        from unittest.mock import patch
+        with patch.object(cli.os, "_exit") as exit_mock:
+            for i in range(1, 50):
+                c._level_msgs = i * 250  # input fine, tee counter stays 0
+                c._levels_watchdog()
+        exit_mock.assert_not_called()
+
+    def test_watchdog_report_names_the_last_peer_operation(self):
+        c = self.make(vox=cli.Vox())
+        c._note_peer_op("add-start", "abc123")
+        buf = io.StringIO()
+        from unittest.mock import patch
+        with patch.object(cli.os, "_exit"), contextlib.redirect_stderr(buf):
+            c._level_msgs = 1
+            for _ in range(8):
+                c._levels_watchdog()
+        self.assertIn("add-start abc123", buf.getvalue())
 
     def test_off_delays_only_what_is_sent_never_what_the_gate_listens_to(self):
         launch = self.launch_string(self.make(vox=cli.Vox(-55, 20, 1500), preroll_ms=300, squelch="off"))
