@@ -268,6 +268,9 @@ function broadcastPeerList() {
 
 wss.on('connection', (ws, req) => {
   if (clients.size >= MAX_CLIENTS) {
+    // Without a listener, a bad frame sent while this socket is closing
+    // (invalid UTF-8, oversize) is an unhandled 'error' and kills the process.
+    ws.on('error', () => ws.terminate());
     fullThrottle(remoteIp(req), (suppressed) => log.warn('reject-full', { ip: remoteIp(req), max_clients: MAX_CLIENTS, suppressed }));
     ws.close(1013, 'server full');
     return;
@@ -321,6 +324,13 @@ wss.on('connection', (ws, req) => {
       }
       log.info('join', { id: shortId(id), name: me.name, priority: me.priority, again, clients: joinedCount() });
       broadcastPeerList();
+      // A late joiner (e.g. the gateway reconnecting) must learn who is talking
+      // now; otherwise it stays unaware until the next floor change. Sent only
+      // while the floor is held, and without re-granting or re-arming the timer.
+      if (floorHolder !== null) {
+        const holder = clients.get(floorHolder);
+        send(ws, { type: 'floor', holder: floorHolder, name: holder?.name || null, priority: !!holder?.priority });
+      }
       return;
     }
 

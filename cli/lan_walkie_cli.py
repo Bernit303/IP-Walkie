@@ -117,6 +117,15 @@ def safe_text(value, limit=64):
     return text[:limit] or "?"
 
 
+def normalize_ws_url(url):
+    """Lower-case the scheme. URL schemes are case-insensitive (the websockets
+    library treats WS:// as plaintext), but the TLS and token checks below
+    compare the text, so 'WS://host' would otherwise slip past them."""
+    url = str(url).strip()
+    scheme, sep, rest = url.partition("://")
+    return scheme.lower() + sep + rest if sep else url
+
+
 def sha256_pin(der_bytes):
     return hashlib.sha256(der_bytes).hexdigest()
 
@@ -352,7 +361,7 @@ class WalkieClient:
         squelch="on",
         rx_gain_db=0.0,
     ):
-        self.url = url
+        self.url = normalize_ws_url(url)
         self.rx_gain_db = rx_gain_db  # boost for audio arriving from the LAN, applied per peer before the mixer
         # Loudness of each peer's audio as received, gathered while they hold the
         # floor and summarised when they let go: peer id -> {"n", "pow", "peak"}.
@@ -381,6 +390,7 @@ class WalkieClient:
         self.max_ptt_seconds = max_ptt_seconds
         self._unkey_handle = None
         self._ptt_watchdog = None
+        self._beep_timers = []  # scheduled roger-beep notes, cancelled by _end_beep
         self._vox_blocked_until = 0.0
         self.vox_debug = vox_debug
         self._level_msgs = 0
@@ -524,11 +534,12 @@ class WalkieClient:
         if self.beep_gate is None or self.beep_src is None:
             return 0
         try:
+            self._cancel_beep_timers()
             offset = 0
             for freq, ms in BEEP_PATTERN:
-                self.loop.call_later(offset / 1000.0, self._beep_note, freq)
+                self._beep_timers.append(self.loop.call_later(offset / 1000.0, self._beep_note, freq))
                 offset += ms
-            self.loop.call_later(offset / 1000.0, self._end_beep)
+            self._beep_timers.append(self.loop.call_later(offset / 1000.0, self._end_beep))
         except Exception:
             self._end_beep()
             return 0
@@ -543,7 +554,15 @@ class WalkieClient:
         except Exception:
             pass
 
+    def _cancel_beep_timers(self):
+        timers, self._beep_timers = self._beep_timers, []
+        for handle in timers:
+            handle.cancel()
+
     def _end_beep(self):
+        # Also drop any notes still scheduled: they would reopen the gate
+        # after a reset or into the next transmission.
+        self._cancel_beep_timers()
         if self.beep_gate is None:
             return
         try:
@@ -810,10 +829,12 @@ class WalkieClient:
             self._status("[radio: TX keyed]")
         # Watchdog: the server's own transmit timeout should end a floor
         # first; this is the local backstop that guarantees the radio never
-        # stays keyed if signaling or a peer misbehaves.
-        if self._ptt_watchdog:
-            self._ptt_watchdog.cancel()
-        self._ptt_watchdog = self.loop.call_later(self.max_ptt_seconds, self._watchdog_unkey)
+        # stays keyed if signaling or a peer misbehaves. It limits how long
+        # the radio stays CONTINUOUSLY keyed, so it is armed once, when the
+        # key goes down, and survives tails and speaker handovers. Only a
+        # real unkey (_do_unkey) clears it.
+        if self._ptt_watchdog is None:
+            self._ptt_watchdog = self.loop.call_later(self.max_ptt_seconds, self._watchdog_unkey)
 
     def _watchdog_unkey(self):
         print("\n[radio: max PTT time reached — unkeying]", file=sys.stderr)
@@ -823,9 +844,8 @@ class WalkieClient:
         """extra_ms: hold the key that much longer, so a roger beep finishes on air."""
         if not self.ptt:
             return
-        if self._ptt_watchdog:
-            self._ptt_watchdog.cancel()
-            self._ptt_watchdog = None
+        # The max-PTT watchdog is deliberately left running here: a tail that
+        # gets cancelled by the next speaker must not restart the clock.
         if self._unkey_handle:
             self._unkey_handle.cancel()
             self._unkey_handle = None
@@ -840,6 +860,10 @@ class WalkieClient:
         self._unkey_handle = None
         was_keyed = self.ptt.keyed
         self.ptt.unkey()  # always write the idle state, as a safety measure
+        # Only now, with the write done, is the continuous-keying clock over.
+        if self._ptt_watchdog:
+            self._ptt_watchdog.cancel()
+            self._ptt_watchdog = None
         if not was_keyed:
             # Nothing was transmitting, so there is no TX leak to wait out.
             # Blocking VOX here would cancel our own radio->LAN transmission:
@@ -1199,12 +1223,22 @@ class WalkieClient:
             if self.floor_holder and self.floor_holder != self.my_id:
                 self.rx_stats.pop(self.floor_holder, None)  # fresh numbers per transmission
             if self.floor_holder == self.my_id:
-                self.have_floor = True
-                self.mic_mute.set_property("mute", False)
-                # We are the source; the radio must not be transmitting.
-                self.radio_unkey(immediate=True)
-                self._status("[TALKING]")
+                if self._beep_timers:
+                    self._end_beep()  # an old courtesy tone must not ride into this transmission
+                if not self.talking:
+                    # The grant arrived after we had already let go (a ptt-stop
+                    # is on its way): keep the microphone closed.
+                    self.mic_mute.set_property("mute", True)
+                    self._status("[grant ignored: talk request already released]")
+                else:
+                    self.have_floor = True
+                    self.mic_mute.set_property("mute", False)
+                    # We are the source; the radio must not be transmitting.
+                    self.radio_unkey(immediate=True)
+                    self._status("[TALKING]")
             elif self.floor_holder:
+                if self._beep_timers:
+                    self._end_beep()
                 self.mic_mute.set_property("mute", True)
                 if self.have_floor:
                     self.have_floor = False
@@ -1311,7 +1345,7 @@ class WalkieClient:
 
     def check_server_identity(self, ws):
         """Returns True if this connection's server is authenticated."""
-        if self.url.startswith("ws://"):
+        if not self.url.startswith("wss://"):
             return False
         if self.tls_mode in ("system", "ca-file"):
             return True  # the TLS handshake already verified it

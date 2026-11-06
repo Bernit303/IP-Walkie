@@ -731,6 +731,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_own_floor_unkeys_immediately(self):
         c, ptt = self.make_client()
         await c.handle_message(floor("bbbb", "Dad"))
+        c.talking = True  # we asked for the floor
         await c.handle_message(floor("aaaa", "Radio"))
         self.assertFalse(ptt.keyed)
         self.assertTrue(c.have_floor)
@@ -741,6 +742,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         # reported "stop", and the floor was released again immediately.
         c, ptt = self.make_client()
         c.vox.active = True
+        c.talking = True  # VOX asked for the floor
         await c.handle_message(floor("aaaa", "Radio"))
         self.assertEqual(c._vox_blocked_until, 0.0)
         self.assertEqual(c.vox.update(-10, 20, blocked=False), None)  # still active, not stopped
@@ -908,6 +910,94 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         c, _ = self.make_beep_client()
         c.reset_for_reconnect()
         c.beep_gate.set_property.assert_called_with("mute", True)
+
+    # ---------- audit fixes (F02, F04, F08, F11) ----------
+
+    async def test_max_ptt_is_continuous_keyed_time_not_per_speaker(self):
+        # Speakers handing over inside the tail must not restart the clock
+        # (max_ptt_seconds is 1 here, the tail is 50 ms).
+        c, ptt = self.make_client()
+        await c.handle_message(floor("bbbb", "Dad"))
+        unkeyed_at = None
+        start = asyncio.get_running_loop().time()
+        for i in range(14):
+            await asyncio.sleep(0.1)
+            if not ptt.keyed and unkeyed_at is None:
+                unkeyed_at = asyncio.get_running_loop().time() - start
+            # a handover inside the tail, as the server does for back-to-back speakers
+            await c.handle_message(floor(None))
+            await c.handle_message(floor("cccc" if i % 2 else "bbbb", "X"))
+        self.assertIsNotNone(unkeyed_at, "radio never unkeyed despite continuous keying")
+        self.assertLess(unkeyed_at, 1.4)  # limit is 1 s
+
+    async def test_tail_cancelled_by_next_speaker_keeps_the_original_deadline(self):
+        c, ptt = self.make_client()
+        await c.handle_message(floor("bbbb", "Dad"))
+        deadline = c._ptt_watchdog.when()
+        await c.handle_message(floor(None))
+        await c.handle_message(floor("bbbb", "Dad"))
+        self.assertEqual(c._ptt_watchdog.when(), deadline)
+
+    async def test_real_unkey_clears_the_limit_so_the_next_transmission_gets_a_full_one(self):
+        c, ptt = self.make_client()
+        await c.handle_message(floor("bbbb", "Dad"))
+        await c.handle_message(floor(None))
+        await asyncio.sleep(0.15)
+        self.assertFalse(ptt.keyed)
+        self.assertIsNone(c._ptt_watchdog)
+        await c.handle_message(floor("bbbb", "Dad"))
+        self.assertIsNotNone(c._ptt_watchdog)
+
+    def test_url_scheme_is_case_insensitive_for_the_token_guard(self):
+        self.assertEqual(cli.normalize_ws_url("WS://h:1"), "ws://h:1")
+        self.assertEqual(cli.normalize_ws_url("Wss://H:1/Path"), "wss://H:1/Path")
+        c = cli.WalkieClient("WS://x:8443", "R", "src", "sink", None, "system")
+        self.assertEqual(c.url, "ws://x:8443")
+        ws = types.SimpleNamespace(transport=types.SimpleNamespace(get_extra_info=lambda k: None))
+        self.assertFalse(c.check_server_identity(ws))
+        self.assertIsNone(c.make_ssl_context())
+        c2 = cli.WalkieClient("WSS://x:8443", "R", "src", "sink", None, "system")
+        self.assertEqual(c2.url, "wss://x:8443")
+        self.assertTrue(c2.check_server_identity(ws))
+
+    async def test_grant_after_release_does_not_open_the_microphone(self):
+        c, _ = self.make_client()
+        await c.start_talk()
+        await c.stop_talk()
+        c.mic_mute.reset_mock()
+        await c.handle_message(floor("aaaa", "Radio"))  # the delayed grant
+        self.assertFalse(c.have_floor)
+        for call in c.mic_mute.set_property.call_args_list:
+            self.assertNotEqual(call.args, ("mute", False))
+
+    async def test_grant_while_still_wanting_to_talk_opens_the_microphone(self):
+        c, _ = self.make_client()
+        await c.start_talk()
+        await c.handle_message(floor("aaaa", "Radio"))
+        self.assertTrue(c.have_floor)
+        c.mic_mute.set_property.assert_called_with("mute", False)
+
+    async def test_reset_cancels_scheduled_beep_notes(self):
+        c, _ = self.make_beep_client()
+        await c.handle_message(floor("bbbb", "Dad"))
+        await c.handle_message(floor(None))  # schedules the beep notes
+        self.assertTrue(c._beep_timers)
+        c.reset_for_reconnect()
+        c.beep_gate.set_property.reset_mock()
+        await asyncio.sleep(0.6)  # longer than the whole pattern
+        for call in c.beep_gate.set_property.call_args_list:
+            self.assertNotEqual(call.args, ("mute", False), "a stale beep note reopened the gate")
+
+    async def test_new_floor_cancels_a_beep_still_playing(self):
+        c, _ = self.make_beep_client()
+        await c.handle_message(floor("bbbb", "Dad"))
+        await c.handle_message(floor(None))
+        c.beep_gate.set_property.reset_mock()
+        await c.handle_message(floor("cccc", "Mom"))
+        self.assertEqual(c._beep_timers, [])
+        await asyncio.sleep(0.6)
+        for call in c.beep_gate.set_property.call_args_list:
+            self.assertNotEqual(call.args, ("mute", False))
 
     def test_failed_beep_branch_leaves_the_rest_of_the_pipeline_alone(self):
         made = cli.Gst.ElementFactory.make.return_value

@@ -461,6 +461,10 @@ function startTalk() {
 
 function stopTalk() {
   wantTalk = false;
+  // Close the microphone at once, locally. Waiting for the server's release
+  // would leave it live whenever signaling is slow or stalled.
+  if (audioTrack) audioTrack.enabled = false;
+  pttBtn.classList.remove('active');
   if (!audioTrack || floorHolder !== myId || !ws || ws.readyState !== WebSocket.OPEN) return;
   wsSend({ type: 'ptt-stop' });
 }

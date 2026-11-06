@@ -585,3 +585,50 @@ test('a hostile FRAME_ANCESTORS value is ignored and framing stays denied', asyn
     }
   }
 });
+
+test('a bad frame sent to a connection refused as "server full" does not crash the server', async () => {
+  const s = await startServer({ MAX_CLIENTS: '1' });
+  const raw = [];
+  try {
+    const wsUrl = `wss://127.0.0.1:${s.port}`;
+    const first = new WebSocket(wsUrl, { rejectUnauthorized: false });
+    raw.push(first);
+    await new Promise((resolve, reject) => { first.on('open', resolve); first.on('error', reject); });
+    await sleep(100);
+    for (let i = 0; i < 5; i++) {
+      const extra = new WebSocket(wsUrl, { rejectUnauthorized: false });
+      raw.push(extra);
+      extra.on('error', () => {});
+      await new Promise((resolve) => { extra.on('open', resolve); extra.on('error', resolve); });
+      if (extra.readyState === WebSocket.OPEN) {
+        const frame = WebSocket.Sender.frame(Buffer.from([0xff, 0xfe, 0xfd]), {
+          fin: true, rsv1: false, opcode: 0x01, mask: true, readOnly: false,
+        });
+        extra._socket.write(Buffer.concat(frame));
+      }
+    }
+    await sleep(300);
+    assert.equal(s.child.exitCode, null, 'server exited');
+    assert.ok(s.out.includes(' reject-full '), 'the full connection was refused');
+    assert.ok(!s.out.includes('uncaught-exception'), s.out);
+  } finally {
+    for (const w of raw) w.terminate();
+    s.child.kill();
+  }
+});
+
+test('a client that joins while someone is talking is told who has the floor', async () => {
+  const talker = await client('Talker', null);
+  send(talker, { type: 'ptt-start' });
+  await waitFor(() => last(talker, 'floor')?.holder === talker.id);
+  const late = await client('Late', null);
+  const floor = last(late, 'floor');
+  assert.ok(floor, 'late joiner received no floor message');
+  assert.equal(floor.holder, talker.id);
+  assert.equal(floor.name, 'Talker');
+});
+
+test('a client that joins an idle channel gets no floor message', async () => {
+  const c = await client('Quiet', null);
+  assert.equal(last(c, 'floor'), undefined);
+});

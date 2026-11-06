@@ -12,6 +12,20 @@
   in about 5 s) if the radio input or the send path produces nothing for 30 s. The restart
   report names the last peer add/remove and dumps the Python thread stacks.
 
+- Server no longer crashes when a bad frame (invalid UTF-8, oversized) arrives on a connection
+  that was just refused because the server is full.
+- A client that joins while someone is talking now receives the current floor state. A gateway
+  that reconnects mid-transmission starts relaying straight away instead of waiting for the
+  next floor change.
+- Gateway: the hard PTT limit now measures continuous keyed time. Back-to-back speakers
+  (handovers inside the unkey tail) no longer restart the clock and keep the radio keyed.
+- CLI: `WS://` (any letter case) is treated as plaintext, so the priority token is not sent.
+- CLI: a floor grant that arrives after the talk request was released no longer opens the
+  microphone.
+- Gateway: roger-beep notes still scheduled when the connection resets, or when the next
+  speaker starts, are cancelled instead of reopening the beep gate later.
+- Browser: releasing Talk closes the microphone immediately instead of waiting for the server.
+
 ### Added
 - Optional `FRAME_ANCESTORS` (space- or comma-separated origins) lets the page be embedded in an
   iframe, e.g. a Home Assistant dashboard. Unset keeps framing denied. Invalid entries are
